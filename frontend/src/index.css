@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-display: 'Playfair Display', Georgia, serif;
+  --font-body: 'Noto Sans SC', system-ui, sans-serif;
+
+  /* 温暖纸质感调色板 */
+  --bg-primary: #FAF7F2;
+  --bg-secondary: #F5F0E8;
+  --bg-card: #FFFFFF;
+  --bg-sidebar: #F0EBE3;
+
+  --text-primary: #2D2926;
+  --text-secondary: #6B6560;
+  --text-tertiary: #A39E99;
+  --text-muted: #C4BFB9;
+
+  --border-light: #E8E2DA;
+  --border-medium: #D9D2C8;
+
+  /* Agent 主题色 */
+  --architect: #D4A574;
+  --architect-light: #F5E6D3;
+  --architect-soft: #FAF3EC;
+
+  --critic: #C97B7B;
+  --critic-light: #F5DEDE;
+  --critic-soft: #FCF5F5;
+
+  --writer: #7BA89C;
+  --writer-light: #D4E8E2;
+  --writer-soft: #F0F7F5;
+
+  --user-accent: #5B7BA3;
+  --user-accent-light: #D6E0EC;
+
+  --shadow-soft: 0 2px 12px rgba(45, 41, 38, 0.06);
+  --shadow-medium: 0 4px 20px rgba(45, 41, 38, 0.1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-medium);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* 字体工具类 */
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-body {
+  font-family: var(--font-body);
+}

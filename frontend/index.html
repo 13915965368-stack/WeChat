@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Hub</title>
+    <!-- 字体使用本地备用方案，避免网络加载阻塞 -->
+    <style>
+      /* 系统字体回退，无需等待网络加载 */
+      @font-face {
+        font-family: 'Playfair Display';
+        font-style: normal;
+        font-weight: 500 700;
+        font-display: swap;
+        src: local('Playfair Display'), local('Georgia'), local('Times New Roman');
+      }
+      @font-face {
+        font-family: 'Noto Sans SC';
+        font-style: normal;
+        font-weight: 300 600;
+        font-display: swap;
+        src: local('Noto Sans SC'), local('PingFang SC'), local('Microsoft YaHei'), local('SimHei');
+      }
+    </style>
+    <!-- 异步加载 Google Fonts，不阻塞渲染 -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=Noto+Sans+SC:wght@300;400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

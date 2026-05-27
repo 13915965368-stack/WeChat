@@ -1,0 +1,56 @@
+# OS and editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.sw?
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+
+# Python backend
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/.venv/
+backend/.venv/
+backend/agent_mvp_backend.egg-info/
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Node frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+coverage/
+
+# Build and cache artifacts
+*.tmp
+*.temp
+
+# Local project references not needed for deployment
+docs/
+backend/API接口梳理.xlsx
+前端模块与API接口清单.xlsx
