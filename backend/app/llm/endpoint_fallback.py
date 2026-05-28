@@ -5,7 +5,7 @@ from typing import Callable, TypeVar
 
 from app.llm.provider_aliases import normalize_provider_alias
 from app.llm.schemas import AdapterConfig
-from app.llm.validator import LLMValidationError
+from app.llm.validator import LLMStreamInterruptedError, LLMValidationError
 
 T = TypeVar("T")
 
@@ -77,6 +77,8 @@ def run_with_endpoint_fallback(
         try:
             return operation(candidate_config)
         except LLMValidationError:
+            raise
+        except LLMStreamInterruptedError:
             raise
         except Exception as exc:
             attempts.append(

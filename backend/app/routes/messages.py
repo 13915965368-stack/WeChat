@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.common import error_response
 from app.db import get_db
 from app.llm.endpoint_fallback import EndpointFallbackError
-from app.llm.validator import LLMValidationError
+from app.llm.validator import LLMStreamInterruptedError, LLMValidationError
 from app.models import Conversation, Message
 from app.schemas import (
     ErrorDetail,
@@ -111,6 +111,8 @@ def post_message(payload: MessageCreate, db: Session = Depends(get_db)):
         result = send_message(db, conversation, content, attachments=attachments)
     except LLMValidationError as exc:
         return error_response(exc.status_code, exc.code, str(exc))
+    except LLMStreamInterruptedError as exc:
+        return error_response(422, "model_stream_interrupted", str(exc))
     except EndpointFallbackError as exc:
         return error_response(422, "model_endpoint_failed", str(exc))
     except ValueError as exc:

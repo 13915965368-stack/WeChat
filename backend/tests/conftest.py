@@ -41,6 +41,36 @@ def client(test_db_path: Path):
 @pytest.fixture(autouse=True)
 def stub_external_llm_provider_calls(monkeypatch: pytest.MonkeyPatch):
     original_post = httpx.post
+    original_stream = httpx.stream
+
+    class FakeStreamResponse:
+        def __init__(self, *, lines: list[str], url_text: str, content_type: str = "text/event-stream") -> None:
+            self._lines = lines
+            self.status_code = 200
+            self.headers = {"content-type": content_type}
+            self.text = "\n".join(lines)
+            self._request = httpx.Request("POST", url_text)
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_lines(self):
+            return iter(self._lines)
+
+        def json(self):
+            raise ValueError("stream responses do not expose a single JSON payload")
+
+    class FakeStreamContext:
+        def __init__(self, response: FakeStreamResponse) -> None:
+            self.response = response
+            self.closed = False
+
+        def __enter__(self) -> FakeStreamResponse:
+            return self.response
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            self.closed = True
+            return False
 
     def fake_post(url, *args, **kwargs):
         url_text = str(url)
@@ -96,4 +126,45 @@ def stub_external_llm_provider_calls(monkeypatch: pytest.MonkeyPatch):
             )
         return original_post(url, *args, **kwargs)
 
+    def fake_stream(method, url, *args, **kwargs):
+        url_text = str(url)
+        if url_text.startswith(("http://localhost", "http://127.0.0.1")):
+            return original_stream(method, url, *args, **kwargs)
+        payload = kwargs.get("json", {})
+        if "/chat/completions" in url_text and payload.get("stream") is True:
+            return FakeStreamContext(
+                FakeStreamResponse(
+                    url_text=url_text,
+                    lines=[
+                        'data: {"choices":[{"delta":{"content":"stubbed openai response"},"finish_reason":"stop"}]}',
+                        "data: [DONE]",
+                    ],
+                )
+            )
+        if url_text.rstrip("/").endswith("/messages") and payload.get("stream") is True:
+            return FakeStreamContext(
+                FakeStreamResponse(
+                    url_text=url_text,
+                    lines=[
+                        'data: {"type":"message_start","message":{"id":"msg_stub"}}',
+                        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"stubbed anthropic response"}}',
+                        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+                        'data: {"type":"message_stop"}',
+                        "data: [DONE]",
+                    ],
+                )
+            )
+        if ":streamGenerateContent" in url_text:
+            return FakeStreamContext(
+                FakeStreamResponse(
+                    url_text=url_text,
+                    lines=[
+                        'data: {"candidates":[{"content":{"parts":[{"text":"stubbed gemini response"}]},"finishReason":"STOP"}]}',
+                        "data: [DONE]",
+                    ],
+                )
+            )
+        return original_stream(method, url, *args, **kwargs)
+
     monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)

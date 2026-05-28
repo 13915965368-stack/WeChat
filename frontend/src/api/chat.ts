@@ -224,8 +224,6 @@ const MODEL_API_FORMAT_SET = new Set<ModelApiFormat>([
 ]);
 const RESERVED_FUTURE_GROUP_MESSAGE_EVENT_SET = new Set<ReservedFutureGroupRuntimeEventType>([
   "agent_thinking",
-  "tool_call",
-  "tool_result",
   "dispatch_progress",
 ]);
 
@@ -770,6 +768,37 @@ export function sendGroupMessageStream(
               conversationId: payloadData.conversationId,
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
               runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
+            },
+          });
+          return;
+        }
+        if (event.event === "tool_call") {
+          onEvent({
+            event: "tool_call",
+            payload: {
+              conversationId: payloadData.conversationId,
+              conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
+              agentId: payloadData.agentId ?? payloadData.agent_id ?? "",
+              agentName: payloadData.agentName ?? payloadData.agent_name ?? "",
+              toolCallId: payloadData.toolCallId ?? payloadData.tool_call_id ?? "",
+              toolName: payloadData.toolName ?? payloadData.tool_name ?? "",
+              toolArgs: payloadData.toolArgs ?? payloadData.tool_args ?? {},
+            },
+          });
+          return;
+        }
+        if (event.event === "tool_result") {
+          onEvent({
+            event: "tool_result",
+            payload: {
+              conversationId: payloadData.conversationId,
+              conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
+              agentId: payloadData.agentId ?? payloadData.agent_id ?? "",
+              toolCallId: payloadData.toolCallId ?? payloadData.tool_call_id ?? "",
+              toolName: payloadData.toolName ?? payloadData.tool_name ?? "",
+              resultPreview: payloadData.resultPreview ?? payloadData.result_preview ?? "",
             },
           });
           return;

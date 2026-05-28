@@ -14,10 +14,20 @@ from app.common import utc_now_iso
 from app.config import get_settings
 from app.llm.client_factory import create_client
 from app.llm.endpoint_fallback import EndpointFallbackError, run_with_endpoint_fallback
-from app.llm.schemas import AdapterCapabilities, AdapterConfig, AttachmentRef, ChatMessage, ChatRequest
+from app.llm.schemas import (
+    AdapterCapabilities,
+    AdapterConfig,
+    AttachmentRef,
+    ChatMessage,
+    ChatRequest,
+    ToolRuntimeContext,
+)
+from app.llm.tool_loop import run_tool_loop
+from app.llm.tools.registry import get_tool_definitions
 from app.llm.validator import LLMValidationError
 from app.models import Agent, Conversation, LLMSettings, Message, ModelConfig
 from app.security import decrypt_secret
+from app.services.search_service import build_search_runtime_config
 
 
 @dataclass
@@ -969,6 +979,33 @@ def generate_group_moderator_note(
     )
 
 
+def _replace_chat_request_config(request: ChatRequest, config: AdapterConfig) -> ChatRequest:
+    """Return a new ChatRequest with the config replaced (for endpoint fallback)."""
+    return ChatRequest(
+        config=config,
+        messages=request.messages,
+        agent_id=request.agent_id,
+        agent_name=request.agent_name,
+        user_text=request.user_text,
+        system_prompt=request.system_prompt,
+        is_group=request.is_group,
+        attachments=request.attachments,
+        metadata=request.metadata,
+        tools=request.tools,
+    )
+
+
+def _build_tool_runtime_context(conversation: Conversation, agent: Agent) -> ToolRuntimeContext:
+    settings = get_settings()
+    return ToolRuntimeContext(
+        conversation_id=conversation.id,
+        agent_id=agent.id,
+        agent_name=agent.name,
+        is_group=conversation.type == "group",
+        search_config=build_search_runtime_config(settings),
+    )
+
+
 def generate_agent_reply(
     db: Session,
     conversation: Conversation,
@@ -980,27 +1017,35 @@ def generate_agent_reply(
     replied_agent_ids: list[str] | None = None,
     event_window: list[dict[str, Any]] | None = None,
     dispatch_state: dict[str, Any] | None = None,
+    on_tool_call: Any | None = None,
+    on_tool_result: Any | None = None,
 ) -> str:
     adapter_config = resolve_adapter_config(db, conversation, agent)
+    tool_context = _build_tool_runtime_context(conversation, agent)
+    chat_request = build_chat_request(
+        config=adapter_config,
+        conversation=conversation,
+        agent=agent,
+        content=content,
+        is_group=conversation.type == "group",
+        attachments=attachments,
+        history_messages=history_messages,
+        member_summary=member_summary,
+        replied_agent_ids=replied_agent_ids,
+        event_window=event_window,
+        dispatch_state=dispatch_state,
+    )
+    chat_request.tools = get_tool_definitions(tool_context)
+
     return run_with_endpoint_fallback(
         adapter_config,
-        lambda candidate_config: create_client(candidate_config)
-        .chat(
-            build_chat_request(
-                config=candidate_config,
-                conversation=conversation,
-                agent=agent,
-                content=content,
-                is_group=conversation.type == "group",
-                attachments=attachments,
-                history_messages=history_messages,
-                member_summary=member_summary,
-                replied_agent_ids=replied_agent_ids,
-                event_window=event_window,
-                dispatch_state=dispatch_state,
-            )
-        )
-        .content,
+        lambda candidate_config: run_tool_loop(
+            create_client(candidate_config),
+            _replace_chat_request_config(chat_request, candidate_config),
+            tool_context=tool_context,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+        ).content,
     )
 
 
@@ -1484,7 +1529,32 @@ def stream_group_message(
             "event_window": runtime_state.event_window,
             "dispatch_state": runtime_state.dispatch_state,
         }
+
+        tool_events_buffer: list[tuple[str, dict[str, Any]]] = []
+
+        def on_tool_call(tc):
+            tool_events_buffer.append(("tool_call", {
+                "conversation_id": conversation.id,
+                "agent_id": agent.id,
+                "agent_name": agent.name,
+                "tool_call_id": tc.id,
+                "tool_name": tc.name,
+                "tool_args": tc.arguments,
+            }))
+
+        def on_tool_result(tc, result):
+            tool_events_buffer.append(("tool_result", {
+                "conversation_id": conversation.id,
+                "agent_id": agent.id,
+                "tool_call_id": tc.id,
+                "tool_name": tc.name,
+                "result_preview": result[:500],
+            }))
+
+        reply_kwargs["on_tool_call"] = on_tool_call
+        reply_kwargs["on_tool_result"] = on_tool_result
         reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
+
         try:
             reply_content = generate_agent_reply(
                 db,
@@ -1548,6 +1618,19 @@ def stream_group_message(
             db.commit()
             db.refresh(reply_message)
             db.refresh(conversation)
+            for event_type, event_payload in tool_events_buffer:
+                yield (
+                    event_type,
+                    {
+                        **event_payload,
+                        "conversation_updated_at": conversation.updated_at,
+                        "runtime_hooks": _get_runtime_hooks_payload(
+                            event_window=runtime_state.event_window,
+                            dispatch_state=runtime_state.dispatch_state,
+                        ),
+                    },
+                )
+            tool_events_buffer.clear()
             yield (
                 "agent_message",
                 {

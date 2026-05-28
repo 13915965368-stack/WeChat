@@ -9,7 +9,13 @@ from app.llm.schemas import (
     ValidationRequest,
     ValidationResult,
 )
-from app.llm.validator import LLMValidationError, normalize_adapter_config, validate_chat_request
+from app.llm.validator import (
+    LLMStreamInterruptedError,
+    LLMStreamProtocolError,
+    LLMValidationError,
+    normalize_adapter_config,
+    validate_chat_request,
+)
 
 __all__ = [
     "AdapterCapabilities",
@@ -18,6 +24,8 @@ __all__ = [
     "ChatMessage",
     "ChatRequest",
     "ChatResponse",
+    "LLMStreamInterruptedError",
+    "LLMStreamProtocolError",
     "LLMValidationError",
     "ValidationRequest",
     "ValidationResult",

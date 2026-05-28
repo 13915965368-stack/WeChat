@@ -7,7 +7,7 @@ import { ChatMessageList } from "./components/ChatMessageList";
 import { MessageComposer } from "./components/MessageComposer";
 import { GroupMemberPanel } from "./components/GroupMemberPanel";
 import { CreateGroupModal } from "./components/CreateGroupModal";
-import { ToolPanel } from "./components/ToolPanel";
+import { ToolPanel, useToolActivities } from "./components/ToolPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ModelPickerModal } from "./components/ModelPickerModal";
 import { ToastViewport, type ToastItem } from "./components/ToastViewport";
@@ -150,6 +150,7 @@ export default function App() {
   const [createModalMode, setCreateModalMode] = useState<"blank" | "context">("blank");
   const [middlePanel, setMiddlePanel] = useState<MiddlePanelState>({ type: "profile" });
   const [activeTool, setActiveTool] = useState<string | null>(null);
+  const { activities: toolActivities, handleToolCall, handleToolResult, clearActivities } = useToolActivities();
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [isCreatingBlankConversation, setIsCreatingBlankConversation] = useState(false);
   const [isCreateAgentModalOpen, setIsCreateAgentModalOpen] = useState(false);
@@ -863,6 +864,14 @@ export default function App() {
                 }
                 syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
                 break;
+              case "tool_call":
+                handleToolCall(event.payload);
+                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                break;
+              case "tool_result":
+                handleToolResult(event.payload);
+                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                break;
               default:
                 break;
             }
@@ -1566,6 +1575,7 @@ export default function App() {
       <ToolPanel
         activeTool={activeTool}
         onSelectTool={(toolId) => setActiveTool(toolId || null)}
+        toolActivities={toolActivities}
       />
     </div>
   );

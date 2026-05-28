@@ -19,6 +19,14 @@ class LLMValidationError(ValueError):
         self.status_code = status_code
 
 
+class LLMStreamInterruptedError(RuntimeError):
+    pass
+
+
+class LLMStreamProtocolError(ValueError):
+    pass
+
+
 def _normalize_optional(value: str | None) -> str | None:
     if value is None:
         return None
@@ -52,9 +60,15 @@ def validate_validation_request(request: ValidationRequest) -> ValidationRequest
 def validate_chat_request(request: ChatRequest) -> ChatRequest:
     normalized_config = normalize_adapter_config(request.config)
     normalized_messages = [
-        ChatMessage(role=message.role, content=message.content)
+        ChatMessage(
+            role=message.role,
+            content=message.content,
+            tool_calls=list(message.tool_calls),
+            tool_call_id=message.tool_call_id,
+            reasoning_content=message.reasoning_content,
+        )
         for message in request.messages
-        if message.content.strip()
+        if message.content.strip() or message.tool_calls or message.reasoning_content.strip()
     ]
     user_text = request.user_text.strip()
 

@@ -218,18 +218,33 @@ export type StreamErrorDetail = {
   message: string;
 };
 
+export type ToolCallPayload = {
+  agentId: string;
+  agentName: string;
+  toolCallId: string;
+  toolName: string;
+  toolArgs: Record<string, unknown>;
+};
+
+export type ToolResultPayload = {
+  agentId: string;
+  toolCallId: string;
+  toolName: string;
+  resultPreview: string;
+};
+
 export type CurrentGroupRuntimeEventType =
   | "user_message"
   | "moderator_note_ready"
   | "agent_message"
   | "conversation_updated"
   | "done"
-  | "error";
+  | "error"
+  | "tool_call"
+  | "tool_result";
 
 export type ReservedFutureGroupRuntimeEventType =
   | "agent_thinking"
-  | "tool_call"
-  | "tool_result"
   | "dispatch_progress";
 
 export type GroupRuntimeEventType =
@@ -282,6 +297,16 @@ type GroupMessageStreamErrorEvent = {
   };
 };
 
+type GroupMessageStreamToolCallEvent = {
+  event: "tool_call";
+  payload: GroupMessageStreamPayloadBase & ToolCallPayload;
+};
+
+type GroupMessageStreamToolResultEvent = {
+  event: "tool_result";
+  payload: GroupMessageStreamPayloadBase & ToolResultPayload;
+};
+
 type GroupMessageStreamReservedFutureEvent = {
   event: ReservedFutureGroupRuntimeEventType;
   payload: GroupMessageStreamPayloadBase & {
@@ -295,6 +320,8 @@ export type GroupMessageStreamEvent =
   | GroupMessageStreamMessageEvent
   | GroupMessageStreamLifecycleEvent
   | GroupMessageStreamErrorEvent
+  | GroupMessageStreamToolCallEvent
+  | GroupMessageStreamToolResultEvent
   | GroupMessageStreamReservedFutureEvent;
 
 export type SendMessagePayload = {

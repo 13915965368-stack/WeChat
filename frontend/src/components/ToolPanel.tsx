@@ -1,46 +1,45 @@
 import { useState } from "react";
+import type { ToolCallPayload, ToolResultPayload } from "../types/chat";
+
+type ToolActivity = {
+  toolCallId: string;
+  toolName: string;
+  agentName: string;
+  status: "calling" | "done";
+  resultPreview?: string;
+};
 
 type Props = {
   activeTool: string | null;
   onSelectTool: (toolId: string) => void;
+  toolActivities?: ToolActivity[];
 };
 
-export function ToolPanel({ activeTool, onSelectTool }: Props) {
+export function ToolPanel({ activeTool, onSelectTool, toolActivities = [] }: Props) {
   const [isExpanded, setIsExpanded] = useState(false);
 
   const tools = [
     {
       id: "search",
-      name: "知识检索",
+      name: "网页搜索",
       icon: (
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <circle cx="11" cy="11" r="8" />
           <line x1="21" y1="21" x2="16.65" y2="16.65" />
         </svg>
       ),
-      description: "搜索知识库",
+      description: "搜索互联网获取最新信息",
     },
     {
-      id: "memory",
-      name: "记忆管理",
+      id: "knowledge",
+      name: "知识检索",
       icon: (
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
+          <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+          <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
         </svg>
       ),
-      description: "管理长期记忆",
-    },
-    {
-      id: "analytics",
-      name: "数据分析",
-      icon: (
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <line x1="18" y1="20" x2="18" y2="10" />
-          <line x1="12" y1="20" x2="12" y2="4" />
-          <line x1="6" y1="20" x2="6" y2="14" />
-        </svg>
-      ),
-      description: "查看对话统计",
+      description: "从知识库检索信息",
     },
     {
       id: "settings",
@@ -141,14 +140,101 @@ export function ToolPanel({ activeTool, onSelectTool }: Props) {
         ))}
       </div>
 
+      {/* 工具调用活动 */}
+      {toolActivities.length > 0 && (
+        <div className="border-t py-2" style={{ borderColor: "var(--border-light)" }}>
+          {isExpanded && (
+            <p className="mb-1 px-3 text-[11px] font-medium" style={{ color: "var(--text-tertiary)" }}>
+              工具调用
+            </p>
+          )}
+          {toolActivities.slice(-3).map((activity) => (
+            <div
+              key={activity.toolCallId}
+              className="flex items-center gap-2 px-2 py-1"
+              title={isExpanded ? undefined : `${activity.agentName}: ${activity.toolName}`}
+            >
+              <div
+                className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded"
+                style={{
+                  background: activity.status === "calling"
+                    ? "rgba(59, 130, 246, 0.1)"
+                    : "rgba(34, 197, 94, 0.1)",
+                  color: activity.status === "calling" ? "#3B82F6" : "#22C55E",
+                }}
+              >
+                {activity.status === "calling" ? (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                  </svg>
+                ) : (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                )}
+              </div>
+              {isExpanded && (
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] truncate" style={{ color: "var(--text-primary)" }}>
+                    {activity.agentName}: {activity.toolName}
+                  </p>
+                  {activity.status === "calling" && (
+                    <p className="text-[10px]" style={{ color: "var(--text-tertiary)" }}>
+                      正在执行...
+                    </p>
+                  )}
+                  {activity.status === "done" && activity.resultPreview && (
+                    <p className="text-[10px] truncate" style={{ color: "var(--text-tertiary)" }}>
+                      {activity.resultPreview.slice(0, 60)}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* 底部信息 */}
       {isExpanded && (
         <div className="border-t p-3" style={{ borderColor: "var(--border-light)" }}>
           <p className="text-center text-[10px]" style={{ color: "var(--text-muted)" }}>
-            工具面板 v1.0
+            工具面板 v2.0
           </p>
         </div>
       )}
     </aside>
   );
+}
+
+export function useToolActivities() {
+  const [activities, setActivities] = useState<ToolActivity[]>([]);
+
+  function handleToolCall(payload: ToolCallPayload) {
+    setActivities((prev) => [
+      ...prev,
+      {
+        toolCallId: payload.toolCallId,
+        toolName: payload.toolName,
+        agentName: payload.agentName,
+        status: "calling" as const,
+      },
+    ]);
+  }
+
+  function handleToolResult(payload: ToolResultPayload) {
+    setActivities((prev) =>
+      prev.map((a) =>
+        a.toolCallId === payload.toolCallId
+          ? { ...a, status: "done" as const, resultPreview: payload.resultPreview }
+          : a
+      )
+    );
+  }
+
+  function clearActivities() {
+    setActivities([]);
+  }
+
+  return { activities, handleToolCall, handleToolResult, clearActivities };
 }

@@ -18,7 +18,55 @@ from app.llm.schemas import (
     ChatRequest,
     ChatResponse,
 )
-from app.llm.validator import LLMValidationError, normalize_adapter_config, validate_chat_request
+from app.llm.validator import (
+    LLMStreamInterruptedError,
+    LLMValidationError,
+    normalize_adapter_config,
+    validate_chat_request,
+)
+
+
+class FakeStreamResponse:
+    def __init__(self, *, url_text: str, lines: list[str], status_code: int = 200, json_body=None) -> None:
+        self.status_code = status_code
+        self.headers = {"content-type": "text/event-stream"}
+        self.text = "\n".join(lines)
+        self._lines = lines
+        self._json_body = json_body
+        self.request = httpx.Request("POST", url_text)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "stream request failed",
+                request=self.request,
+                response=httpx.Response(
+                    self.status_code,
+                    json=self._json_body,
+                    request=self.request,
+                ),
+            )
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def json(self):
+        if self._json_body is None:
+            raise ValueError("no json body configured")
+        return self._json_body
+
+
+class FakeStreamContext:
+    def __init__(self, response: FakeStreamResponse) -> None:
+        self.response = response
+        self.closed = False
+
+    def __enter__(self) -> FakeStreamResponse:
+        return self.response
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.closed = True
+        return False
 
 
 def test_create_client_prefers_api_format_mapping():
@@ -114,19 +162,22 @@ def test_validate_chat_request_rejects_unsupported_images():
 def test_openai_compatible_adapter_maps_remote_unsupported_image_error_to_uniform_code(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def fake_post(url, *, json, headers, timeout):
-        return httpx.Response(
-            400,
-            json={
-                "error": {
-                    "message": "Invalid content type. image_url is only supported by certain models.",
-                    "code": "unsupported_content_type",
-                }
-            },
-            request=httpx.Request("POST", str(url)),
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[],
+                status_code=400,
+                json_body={
+                    "error": {
+                        "message": "Invalid content type. image_url is only supported by certain models.",
+                        "code": "unsupported_content_type",
+                    }
+                },
+            )
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     adapter = OpenAICompatibleAdapter(
         AdapterConfig(
@@ -244,30 +295,46 @@ def test_run_with_endpoint_fallback_aggregates_domestic_and_global_errors():
     assert "https://api.minimax.io/v1 unauthorized" in str(exc_info.value)
 
 
+def test_run_with_endpoint_fallback_does_not_retry_after_stream_interrupted():
+    attempts: list[str] = []
+
+    def fail(candidate: AdapterConfig) -> str:
+        attempts.append(candidate.base_url or "")
+        raise LLMStreamInterruptedError("stream interrupted")
+
+    with pytest.raises(LLMStreamInterruptedError, match="stream interrupted"):
+        run_with_endpoint_fallback(
+            AdapterConfig(
+                provider="qwen",
+                model="qwen-plus",
+                base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            ),
+            fail,
+        )
+
+    assert attempts == ["https://dashscope.aliyuncs.com/compatible-mode/v1"]
+
+
 def test_openai_compatible_adapter_posts_real_chat_payload(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, object] = {}
 
-    def fake_post(url, *, json, headers, timeout):
+    def fake_stream(method, url, *args, **kwargs):
         captured["url"] = str(url)
-        captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "remote openai reply",
-                        }
-                    }
-                ]
-            },
-            request=httpx.Request("POST", str(url)),
+        captured["method"] = method
+        captured["json"] = kwargs["json"]
+        captured["headers"] = kwargs["headers"]
+        captured["timeout"] = kwargs["timeout"]
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"remote openai reply"},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ],
+            )
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     adapter = OpenAICompatibleAdapter(
         AdapterConfig(
@@ -293,6 +360,7 @@ def test_openai_compatible_adapter_posts_real_chat_payload(monkeypatch: pytest.M
 
     assert response.content == "remote openai reply"
     assert response.raw["mode"] == "remote"
+    assert captured["method"] == "POST"
     assert captured["url"] == "https://api.openai.com/v1/chat/completions"
     assert captured["headers"] == {
         "Content-Type": "application/json",
@@ -304,7 +372,9 @@ def test_openai_compatible_adapter_posts_real_chat_payload(monkeypatch: pytest.M
             {"role": "system", "content": "你是一个助手。"},
             {"role": "user", "content": "你好"},
         ],
+        "stream": True,
     }
+    assert isinstance(captured["timeout"], httpx.Timeout)
 
 
 def test_openai_compatible_adapter_merges_multiple_system_messages_into_single_prefixed_system(
@@ -312,24 +382,19 @@ def test_openai_compatible_adapter_merges_multiple_system_messages_into_single_p
 ):
     captured: dict[str, object] = {}
 
-    def fake_post(url, *, json, headers, timeout):
-        captured["json"] = json
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "merged system reply",
-                        }
-                    }
-                ]
-            },
-            request=httpx.Request("POST", str(url)),
+    def fake_stream(method, url, *args, **kwargs):
+        captured["json"] = kwargs["json"]
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"merged system reply"},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ],
+            )
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     adapter = OpenAICompatibleAdapter(
         AdapterConfig(
@@ -369,6 +434,7 @@ def test_openai_compatible_adapter_merges_multiple_system_messages_into_single_p
             },
             {"role": "user", "content": "请继续接力。"},
         ],
+        "stream": True,
     }
 
 
@@ -460,24 +526,18 @@ def test_openai_compatible_adapter_validate_accepts_reasoning_only_response(
 def test_openai_compatible_adapter_chat_still_requires_displayable_content(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def fake_post(url, *, json, headers, timeout):
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "reasoning_content": "The",
-                        }
-                    }
-                ]
-            },
-            request=httpx.Request("POST", str(url)),
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"reasoning_content":"The"}}]}',
+                    "data: [DONE]",
+                ],
+            )
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     adapter = OpenAICompatibleAdapter(
         AdapterConfig(
@@ -504,25 +564,25 @@ def test_openai_compatible_adapter_chat_still_requires_displayable_content(
 def test_anthropic_adapter_posts_messages_payload(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, object] = {}
 
-    def fake_post(url, *, json, headers, timeout):
+    def fake_stream(method, url, *args, **kwargs):
         captured["url"] = str(url)
-        captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
-        return httpx.Response(
-            200,
-            json={
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "remote anthropic reply",
-                    }
-                ]
-            },
-            request=httpx.Request("POST", str(url)),
+        captured["json"] = kwargs["json"]
+        captured["headers"] = kwargs["headers"]
+        captured["timeout"] = kwargs["timeout"]
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"type":"message_start","message":{"id":"msg_123"}}',
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"remote anthropic reply"}}',
+                    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+                    'data: {"type":"message_stop"}',
+                    "data: [DONE]",
+                ],
+            )
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     adapter = AnthropicAdapter(
         AdapterConfig(
@@ -564,36 +624,29 @@ def test_anthropic_adapter_posts_messages_payload(monkeypatch: pytest.MonkeyPatc
             }
         ],
         "system": "你是一个助手。",
+        "stream": True,
     }
 
 
 def test_gemini_adapter_posts_generate_content_payload(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, object] = {}
 
-    def fake_post(url, *, json, headers, timeout):
+    def fake_stream(method, url, *args, **kwargs):
         captured["url"] = str(url)
-        captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
-        return httpx.Response(
-            200,
-            json={
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {
-                                    "text": "remote gemini reply",
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-            request=httpx.Request("POST", str(url)),
+        captured["json"] = kwargs["json"]
+        captured["headers"] = kwargs["headers"]
+        captured["timeout"] = kwargs["timeout"]
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"candidates":[{"content":{"parts":[{"text":"remote gemini reply"}]},"finishReason":"STOP"}]}',
+                    "data: [DONE]",
+                ],
+            )
         )
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     adapter = GeminiAdapter(
         AdapterConfig(
@@ -623,7 +676,7 @@ def test_gemini_adapter_posts_generate_content_payload(monkeypatch: pytest.Monke
     assert response.raw["mode"] == "remote"
     assert (
         captured["url"]
-        == "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=secret-key"
+        == "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent?alt=sse&key=secret-key"
     )
     assert captured["headers"] == {"Content-Type": "application/json"}
     assert captured["json"] == {

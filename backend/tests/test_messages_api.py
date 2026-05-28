@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from app.routes import messages as messages_route
 from app.schemas import MessageStreamRuntimeHooks
+from app.llm.validator import LLMStreamInterruptedError
 from app.services import chat_service
 
 
@@ -242,19 +243,46 @@ def test_post_message_maps_remote_unsupported_image_provider_error_to_uniform_ap
     client,
     monkeypatch,
 ):
-    def fake_post(url, *, json, headers, timeout):
-        return httpx.Response(
-            400,
-            json={
-                "error": {
-                    "message": "Invalid content type. image_url is only supported by certain models.",
-                    "code": "unsupported_content_type",
-                }
-            },
-            request=httpx.Request("POST", str(url)),
-        )
+    class FakeStreamResponse:
+        def __init__(self, url_text: str) -> None:
+            self.status_code = 400
+            self.headers = {"content-type": "text/event-stream"}
+            self.text = ""
+            self.request = httpx.Request("POST", url_text)
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+        def raise_for_status(self) -> None:
+            raise httpx.HTTPStatusError(
+                "stream request failed",
+                request=self.request,
+                response=httpx.Response(
+                    400,
+                    json={
+                        "error": {
+                            "message": "Invalid content type. image_url is only supported by certain models.",
+                            "code": "unsupported_content_type",
+                        }
+                    },
+                    request=self.request,
+                ),
+            )
+
+        def iter_lines(self):
+            return iter(())
+
+    class FakeStreamContext:
+        def __init__(self, url_text: str) -> None:
+            self.response = FakeStreamResponse(url_text)
+
+        def __enter__(self):
+            return self.response
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(str(url))
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
 
     model_config_response = client.post(
         "/api/v1/model-configs",
@@ -305,6 +333,29 @@ def test_post_message_maps_remote_unsupported_image_provider_error_to_uniform_ap
         "error": {
             "code": "IMAGE_NOT_SUPPORTED",
             "message": "image attachments are not supported by the current model",
+        }
+    }
+
+
+def test_post_message_maps_stream_interrupted_to_uniform_api_error(client, monkeypatch):
+    def fake_send_message(db, conversation, content, attachments=None):
+        raise LLMStreamInterruptedError("openai-compatible stream interrupted: peer closed connection")
+
+    monkeypatch.setattr(messages_route, "send_message", fake_send_message)
+
+    response = client.post(
+        "/api/v1/messages",
+        json={
+            "conversationId": "direct-architect-default",
+            "content": "帮我看一下最近王鹤棣的事情",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "model_stream_interrupted",
+            "message": "openai-compatible stream interrupted: peer closed connection",
         }
     }
 

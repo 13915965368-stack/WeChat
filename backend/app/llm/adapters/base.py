@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any
+import json
+from typing import Any, Iterator
 
 import httpx
 
 from app.llm.schemas import ChatRequest, ChatResponse, ValidationRequest, ValidationResult
-from app.llm.validator import LLMValidationError, validate_chat_request, validate_validation_request
+from app.llm.validator import (
+    LLMStreamProtocolError,
+    LLMValidationError,
+    validate_chat_request,
+    validate_validation_request,
+)
 
 STYLE_PREFIX = {
     "architect": "我先从结构上拆一下：",
@@ -58,7 +64,11 @@ def build_local_reply(
 
 class BaseLLMAdapter(ABC):
     adapter_name = "base"
-    request_timeout = 30.0
+    request_timeout = 60.0
+    stream_connect_timeout = 10.0
+    stream_read_timeout = 30.0
+    stream_write_timeout = 10.0
+    stream_pool_timeout = 10.0
 
     def __init__(self, config):
         self.config = config
@@ -128,19 +138,7 @@ class BaseLLMAdapter(ABC):
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = self._extract_error_detail(exc.response)
-            if self._is_remote_image_unsupported(exc.response, detail):
-                raise LLMValidationError(
-                    "image attachments are not supported by the current model",
-                    code="IMAGE_NOT_SUPPORTED",
-                ) from exc
-            if detail:
-                raise ValueError(
-                    f"{self.adapter_name} request failed with status {exc.response.status_code}: {detail}"
-                ) from exc
-            raise ValueError(
-                f"{self.adapter_name} request failed with status {exc.response.status_code}"
-            ) from exc
+            self._raise_http_error(exc)
         except httpx.RequestError as exc:
             raise ValueError(f"{self.adapter_name} request failed: {exc}") from exc
 
@@ -152,6 +150,72 @@ class BaseLLMAdapter(ABC):
         if not isinstance(data, dict):
             raise ValueError(f"{self.adapter_name} returned unexpected response shape")
         return data
+
+    def _build_stream_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(
+            connect=self.stream_connect_timeout,
+            read=self.stream_read_timeout,
+            write=self.stream_write_timeout,
+            pool=self.stream_pool_timeout,
+        )
+
+    def _stream_sse_events(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> Iterator[dict[str, Any]]:
+        try:
+            with httpx.stream(
+                "POST",
+                url,
+                json=payload,
+                headers=headers,
+                timeout=self._build_stream_timeout(),
+            ) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                if "text/event-stream" not in content_type.lower():
+                    raise LLMStreamProtocolError(
+                        f"{self.adapter_name} returned non-SSE response: {content_type or 'unknown content-type'}"
+                    )
+                for raw_line in response.iter_lines():
+                    line = raw_line.strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data_text = line[5:].strip()
+                    if not data_text or data_text == "[DONE]":
+                        continue
+                    try:
+                        parsed = json.loads(data_text)
+                    except ValueError as exc:
+                        raise LLMStreamProtocolError(f"{self.adapter_name} returned invalid SSE JSON") from exc
+                    if not isinstance(parsed, dict):
+                        raise LLMStreamProtocolError(
+                            f"{self.adapter_name} returned unexpected SSE event shape"
+                        )
+                    yield parsed
+        except httpx.HTTPStatusError as exc:
+            self._raise_http_error(exc)
+        except httpx.RequestError as exc:
+            raise LLMStreamProtocolError(f"{self.adapter_name} request failed: {exc}") from exc
+
+    def _raise_http_error(self, exc: httpx.HTTPStatusError) -> None:
+        detail = self._extract_error_detail(exc.response)
+        if self._is_remote_image_unsupported(exc.response, detail):
+            raise LLMValidationError(
+                "image attachments are not supported by the current model",
+                code="IMAGE_NOT_SUPPORTED",
+            ) from exc
+        if detail:
+            raise ValueError(
+                f"{self.adapter_name} request failed with status {exc.response.status_code}: {detail}"
+            ) from exc
+        raise ValueError(
+            f"{self.adapter_name} request failed with status {exc.response.status_code}"
+        ) from exc
 
     def _extract_error_detail(self, response: httpx.Response) -> str:
         details: list[str] = []
@@ -205,10 +269,12 @@ class BaseLLMAdapter(ABC):
         messages: list[dict[str, str]] = []
         for message in request.messages:
             content = message.content.strip()
-            if not content:
+            if not content and not message.tool_calls:
                 continue
             if message.role == "system":
                 system_parts.append(content)
+                continue
+            if message.role == "tool" or message.tool_calls:
                 continue
             messages.append({"role": message.role, "content": content})
         system_prompt = "\n\n".join(system_parts).strip()

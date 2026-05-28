@@ -22,6 +22,7 @@ from app.security import validate_encryption_key
 from app.seed import seed_default_data
 from app.services.attachment_store import InMemoryAttachmentStore
 from app.services.secret_migration_service import migrate_plaintext_api_keys
+from app.llm.tools import register_all_tools
 
 
 @asynccontextmanager
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     with app.state.session_factory() as db:
         migrate_plaintext_api_keys(db, app.state.settings)
         seed_default_data(db)
+    register_all_tools()
     try:
         yield
     finally:
