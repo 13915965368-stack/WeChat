@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Agent, Conversation, Message } from "../types/chat";
+import { getMessagePreviewText } from "../utils/messageContent";
 
 type Props = {
   agents: Agent[];
@@ -41,7 +42,10 @@ function getLastMessagePreview(messages: Message[], conversationId: string): str
   if (convMessages.length === 0) return null;
   const last = convMessages[0];
   const prefix = last.senderType === "user" ? "我: " : "";
-  const content = last.content.length > 24 ? last.content.slice(0, 24) + "…" : last.content;
+  const content = getMessagePreviewText(last);
+  if (!content) {
+    return null;
+  }
   return prefix + content;
 }
 

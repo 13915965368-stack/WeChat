@@ -77,6 +77,10 @@ class Message(Base):
     sender_type: Mapped[str] = mapped_column(String(16), nullable=False)
     sender_id: Mapped[str] = mapped_column(String(64), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    render_format: Mapped[str] = mapped_column(String(32), nullable=False, default="plain_text")
+    thinking_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    usage_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    message_meta: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     attachments: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False)
 

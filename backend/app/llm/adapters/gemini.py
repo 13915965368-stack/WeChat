@@ -4,7 +4,9 @@ import json
 from uuid import uuid4
 
 from app.llm.adapters.base import BaseLLMAdapter
+from app.llm.protocols.common import build_thinking_provider_overrides
 from app.llm.schemas import ChatMessage, ChatRequest, ChatResponse, ToolCall, ValidationRequest, ValidationResult
+from app.llm.usage import normalize_usage
 from app.llm.validator import (
     LLMStreamInterruptedError,
     LLMStreamProtocolError,
@@ -34,6 +36,9 @@ class GeminiAdapter(BaseLLMAdapter):
         payload: dict[str, object] = {"contents": contents}
         if system_prompt:
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+        generation_config = build_thinking_provider_overrides(request)
+        if generation_config:
+            payload["generationConfig"] = generation_config
 
         if request.tools:
             payload["tools"] = [{
@@ -124,6 +129,10 @@ class GeminiAdapter(BaseLLMAdapter):
 
     def _build_chat_response(self, validated: ChatRequest, data: dict[str, object]) -> ChatResponse:
         tool_calls = self._extract_tool_calls(data)
+        usage = normalize_usage(data.get("usageMetadata"))
+        raw: dict[str, object] = {"adapter": self.adapter_name, "mode": "remote"}
+        if data.get("usageMetadata") is not None:
+            raw["usage"] = data.get("usageMetadata")
         if tool_calls:
             content = self._extract_text_content(
                 data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
@@ -133,14 +142,16 @@ class GeminiAdapter(BaseLLMAdapter):
                 provider=validated.config.provider,
                 model=validated.config.model,
                 tool_calls=tool_calls,
-                raw={"adapter": self.adapter_name, "mode": "remote"},
+                raw=raw,
+                usage=usage,
             )
 
         return ChatResponse(
             content=self._extract_response_text(data),
             provider=validated.config.provider,
             model=validated.config.model,
-            raw={"adapter": self.adapter_name, "mode": "remote"},
+            raw=raw,
+            usage=usage,
         )
 
     def _resolve_generate_url(self) -> str:
@@ -160,6 +171,7 @@ class GeminiAdapter(BaseLLMAdapter):
         tool_buffers: list[dict[str, str]] = []
         finish_reason = "stop"
         had_effective_increment = False
+        usage_payload: dict[str, object] | None = None
 
         try:
             for event in self._stream_sse_events(
@@ -182,8 +194,8 @@ class GeminiAdapter(BaseLLMAdapter):
                     for part in parts:
                         if not isinstance(part, dict):
                             continue
-                        text = str(part.get("text", "")).strip()
-                        if text:
+                        text = str(part.get("text", ""))
+                        if text != "":
                             text_parts.append(text)
                             had_effective_increment = True
                         function_call = part.get("functionCall")
@@ -209,6 +221,9 @@ class GeminiAdapter(BaseLLMAdapter):
                 current_finish_reason = first_candidate.get("finishReason")
                 if isinstance(current_finish_reason, str) and current_finish_reason:
                     finish_reason = current_finish_reason.lower()
+                usage_metadata = event.get("usageMetadata")
+                if isinstance(usage_metadata, dict) and usage_metadata:
+                    usage_payload = usage_metadata
         except (LLMStreamProtocolError, ValueError) as exc:
             if had_effective_increment:
                 raise LLMStreamInterruptedError(f"{self.adapter_name} stream interrupted: {exc}") from exc
@@ -241,8 +256,13 @@ class GeminiAdapter(BaseLLMAdapter):
             provider=validated.config.provider,
             model=validated.config.model,
             finish_reason=finish_reason,
-            raw={"adapter": self.adapter_name, "mode": "remote"},
+            raw={
+                "adapter": self.adapter_name,
+                "mode": "remote",
+                **({"usage": usage_payload} if usage_payload is not None else {}),
+            },
             tool_calls=tool_calls,
+            usage=normalize_usage(usage_payload),
         )
 
     def validate(self, request: ValidationRequest | None = None) -> ValidationResult:

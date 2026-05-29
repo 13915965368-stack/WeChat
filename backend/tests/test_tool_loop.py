@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from app.llm.schemas import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    MessageUsage,
     SearchRuntimeConfigSnapshot,
     ToolCall,
     ToolDefinition,
@@ -127,6 +129,45 @@ class TestToolLoopSingleRound:
         assert result.content == "done"
         assert len(captured_requests) == 2
         assert captured_requests[1].messages[1].reasoning_content == "先调用工具再回答"
+
+    def test_tool_loop_accumulates_usage_across_tool_and_final_rounds(self):
+        tool_call = ToolCall(id="tc_1", name="test_tool", arguments={"query": "hello"})
+        client = FakeClient([
+            ChatResponse(
+                content="",
+                provider="mock",
+                model="test",
+                tool_calls=[tool_call],
+                usage=MessageUsage(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+            ),
+            ChatResponse(
+                content="done",
+                provider="mock",
+                model="test",
+                usage=MessageUsage(
+                    prompt_tokens=13,
+                    completion_tokens=17,
+                    reasoning_tokens=5,
+                    total_tokens=30,
+                ),
+            ),
+        ])
+        result = run_tool_loop(client, _make_request(tools=[_make_tool()]))
+        assert result.content == "done"
+        assert result.usage == MessageUsage(
+            prompt_tokens=24,
+            completion_tokens=24,
+            reasoning_tokens=5,
+            total_tokens=48,
+        )
+
+    def test_tool_loop_accepts_simple_namespace_without_usage_or_provider_fields(self):
+        client = FakeClient([])
+        client.responses = [SimpleNamespace(content="simple reply")]
+        result = run_tool_loop(client, _make_request(tools=[_make_tool()]))
+        assert result.content == "simple reply"
+        assert result.provider == ""
+        assert result.model == ""
 
 
 class TestToolLoopCallbacks:

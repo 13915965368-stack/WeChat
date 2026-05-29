@@ -39,7 +39,26 @@ vi.mock("../components/AgentEditPage", () => ({
 }));
 
 vi.mock("../components/ConversationSidebar", () => ({
-  ConversationSidebar: () => <div data-testid="conversation-sidebar" />,
+  ConversationSidebar: ({
+    conversations,
+    onSelectConversation,
+  }: {
+    conversations?: Array<{ id: string; title: string }>;
+    onSelectConversation?: (conversationId: string) => void;
+  }) => (
+    <div data-testid="conversation-sidebar">
+      {(conversations ?? []).map((conversation) => (
+        <button
+          key={conversation.id}
+          type="button"
+          onClick={() => onSelectConversation?.(conversation.id)}
+          aria-label={`侧栏切换 ${conversation.id}`}
+        >
+          切换
+        </button>
+      ))}
+    </div>
+  ),
 }));
 
 vi.mock("../components/ChatMessageList", () => ({
@@ -58,20 +77,40 @@ vi.mock("../components/MessageComposer", () => ({
     sendDisabledReason,
     canAttachImage,
     imageCapabilityReason,
+    showThinkingToggle,
+    thinkingEnabled,
+    onToggleThinking,
     onSend,
   }: {
     canSend?: boolean;
     sendDisabledReason?: string;
     canAttachImage?: boolean;
     imageCapabilityReason?: string;
-    onSend?: (content: string, imageFiles: File[]) => Promise<void> | void;
+    showThinkingToggle?: boolean;
+    thinkingEnabled?: boolean;
+    onToggleThinking?: () => void;
+    onSend?: (
+      content: string,
+      imageFiles: File[],
+      options?: { thinkingEnabled?: boolean }
+    ) => Promise<void> | void;
   }) => (
     <div>
       <div data-testid="send-capability">{canSend ? "enabled" : sendDisabledReason ?? "disabled"}</div>
       <div data-testid="image-capability">
         {canAttachImage ? "image-enabled" : imageCapabilityReason ?? "image-disabled"}
       </div>
-      <button type="button" onClick={() => void onSend?.("请开始群聊接力", [])}>
+      <div data-testid="thinking-toggle-visibility">{showThinkingToggle ? "shown" : "hidden"}</div>
+      <div data-testid="thinking-toggle-state">{thinkingEnabled ? "on" : "off"}</div>
+      {showThinkingToggle ? (
+        <button type="button" onClick={() => onToggleThinking?.()}>
+          切换 thinking
+        </button>
+      ) : null}
+      <button
+        type="button"
+        onClick={() => void onSend?.("请开始群聊接力", [], { thinkingEnabled })}
+      >
         发送测试消息
       </button>
     </div>
@@ -106,7 +145,20 @@ vi.mock("../components/ModelPickerModal", () => ({
 }));
 
 vi.mock("../components/ToastViewport", () => ({
-  ToastViewport: () => null,
+  ToastViewport: ({
+    toasts,
+  }: {
+    toasts?: Array<{ id: string; title: string; description?: string }>;
+  }) => (
+    <div data-testid="toast-viewport">
+      {(toasts ?? []).map((toast) => (
+        <div key={toast.id}>
+          <div>{toast.title}</div>
+          {toast.description ? <div>{toast.description}</div> : null}
+        </div>
+      ))}
+    </div>
+  ),
 }));
 
 vi.mock("../components/CreateAgentModal", () => ({
@@ -115,6 +167,12 @@ vi.mock("../components/CreateAgentModal", () => ({
 
 vi.mock("../components/ToolPanel", () => ({
   ToolPanel: () => null,
+  useToolActivities: () => ({
+    activities: [],
+    handleToolCall: vi.fn(),
+    handleToolResult: vi.fn(),
+    clearActivities: vi.fn(),
+  }),
 }));
 
 import App from "../App";
@@ -279,6 +337,158 @@ describe("App 首页与群聊流程", () => {
     expect(screen.getByTestId("image-capability")).toHaveTextContent(
       "Critic 的模型暂不可用，请先校验或更换模型。"
     );
+    expect(screen.getByTestId("thinking-toggle-visibility")).toHaveTextContent("hidden");
+  });
+
+  it("单聊 thinking 开关按会话维度持久化，并随发送请求透传", async () => {
+    apiMocks.getConversations.mockResolvedValue([
+      {
+        id: "direct-architect",
+        type: "direct",
+        title: "与 Architect 的对话",
+        memberIds: ["user", "architect"],
+        agentId: "architect",
+        modelConfigId: null,
+        isDisabled: false,
+        createdAt: "2026-05-26T00:00:00.000Z",
+        updatedAt: "2026-05-26T00:00:00.000Z",
+        pinned: false,
+        pinnedAt: null,
+      },
+      {
+        id: "direct-critic",
+        type: "direct",
+        title: "与 Critic 的对话",
+        memberIds: ["user", "critic"],
+        agentId: "critic",
+        modelConfigId: "model-openai",
+        isDisabled: false,
+        createdAt: "2026-05-26T00:10:00.000Z",
+        updatedAt: "2026-05-26T00:10:00.000Z",
+        pinned: false,
+        pinnedAt: null,
+      },
+    ]);
+    apiMocks.getModelConfigs.mockResolvedValue([
+      modelConfigs[0],
+      {
+        ...modelConfigs[1],
+        id: "model-openai-2",
+        status: "available",
+        statusMessage: null,
+      },
+    ]);
+    apiMocks.sendMessage.mockResolvedValue({
+      userMessage: {
+        id: "msg-user",
+        conversationId: "direct-architect",
+        senderType: "user",
+        senderId: "user",
+        content: "请开始群聊接力",
+        createdAt: "2026-05-26T10:00:00.000Z",
+      },
+      agentMessages: [],
+      conversationUpdatedAt: "2026-05-26T10:00:01.000Z",
+      usageSummary: null,
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /与 Architect 的对话/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /与 Critic 的对话/ })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /与 Architect 的对话/ }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("thinking-toggle-visibility")).toHaveTextContent("shown");
+      expect(screen.getByTestId("thinking-toggle-state")).toHaveTextContent("off");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "切换 thinking" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("thinking-toggle-state")).toHaveTextContent("on");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "发送测试消息" }));
+
+    await waitFor(() => {
+      expect(apiMocks.sendMessage).toHaveBeenCalledWith({
+        conversationId: "direct-architect",
+        content: "请开始群聊接力",
+        attachments: undefined,
+        options: {
+          thinking: {
+            enabled: true,
+          },
+        },
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "侧栏切换 direct-critic" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("thinking-toggle-state")).toHaveTextContent("off");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "侧栏切换 direct-architect" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("thinking-toggle-state")).toHaveTextContent("on");
+    });
+  });
+
+  it("单聊 warnings 会显示未生成可展示回复提示", async () => {
+    apiMocks.getConversations.mockResolvedValue([
+      {
+        id: "direct-architect",
+        type: "direct",
+        title: "与 Architect 的对话",
+        memberIds: ["user", "architect"],
+        agentId: "architect",
+        modelConfigId: null,
+        isDisabled: false,
+        createdAt: "2026-05-26T00:00:00.000Z",
+        updatedAt: "2026-05-26T00:00:00.000Z",
+        pinned: false,
+        pinnedAt: null,
+      },
+    ]);
+    apiMocks.sendMessage.mockResolvedValue({
+      userMessage: {
+        id: "msg-user",
+        conversationId: "direct-architect",
+        senderType: "user",
+        senderId: "user",
+        content: "请开始群聊接力",
+        createdAt: "2026-05-26T10:00:00.000Z",
+      },
+      agentMessages: [],
+      conversationUpdatedAt: "2026-05-26T10:00:01.000Z",
+      usageSummary: null,
+      warnings: [
+        {
+          code: "model_empty_reply",
+          message: "Architect 未返回可展示回复",
+        },
+      ],
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /与 Architect 的对话/ })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /与 Architect 的对话/ }));
+    fireEvent.click(screen.getByRole("button", { name: "发送测试消息" }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Architect 未返回可展示回复").length).toBeGreaterThan(0);
+      expect(screen.getByText("未生成可展示回复")).toBeInTheDocument();
+    });
   });
 
   it("从直聊发起群聊后会提交来源直聊与真实历史迁移语义", async () => {
@@ -686,7 +896,100 @@ describe("App 首页与群聊流程", () => {
       expect(screen.getByText("请开始群聊接力")).toBeInTheDocument();
       expect(screen.getByText("先拆结构。")).toBeInTheDocument();
       expect(screen.getByText("我来补充结论。")).toBeInTheDocument();
-      expect(screen.getByText("Critic 回复失败：模型超时")).toBeInTheDocument();
+      expect(screen.getAllByText("Critic 回复失败：模型超时").length).toBeGreaterThan(0);
+      expect(screen.getByText("部分成员回复失败")).toBeInTheDocument();
+    });
+  });
+
+  it("群聊流在没有任何成员成功时显示群聊未完成回复提示", async () => {
+    apiMocks.getConversations.mockResolvedValue([
+      {
+        id: "group-stream",
+        type: "group",
+        title: "流式群聊",
+        memberIds: ["user", "architect", "critic"],
+        modelConfigId: null,
+        isDisabled: false,
+        createdAt: "2026-05-26T00:00:00.000Z",
+        updatedAt: "2026-05-26T00:00:00.000Z",
+        pinned: false,
+        pinnedAt: null,
+      },
+    ]);
+    apiMocks.getModelConfigs.mockResolvedValue([
+      modelConfigs[0],
+      {
+        ...modelConfigs[1],
+        status: "available",
+        statusMessage: null,
+      },
+    ]);
+    apiMocks.sendGroupMessageStream.mockImplementation(
+      async (
+        _payload: { conversationId: string; content: string },
+        onEvent: (event: {
+          event: string;
+          payload: {
+            conversationId: string;
+            message?: {
+              id: string;
+              content: string;
+              senderId: string;
+              senderType: "user" | "agent";
+              conversationId: string;
+              createdAt: string;
+            };
+            error?: { message: string };
+            conversationUpdatedAt?: string | null;
+          };
+        }) => void
+      ) => {
+        onEvent({
+          event: "user_message",
+          payload: {
+            conversationId: "group-stream",
+            message: {
+              id: "msg-user",
+              conversationId: "group-stream",
+              senderType: "user",
+              senderId: "user",
+              content: "请开始群聊接力",
+              createdAt: "2026-05-26T10:00:00.000Z",
+            },
+          },
+        });
+        onEvent({
+          event: "error",
+          payload: {
+            conversationId: "group-stream",
+            error: {
+              message: "Architect 回复失败：模型超时",
+            },
+            conversationUpdatedAt: "2026-05-26T10:00:01.000Z",
+          },
+        });
+        onEvent({
+          event: "done",
+          payload: {
+            conversationId: "group-stream",
+            conversationUpdatedAt: "2026-05-26T10:00:01.000Z",
+          },
+        });
+      }
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /流式群聊/ })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /流式群聊/ }));
+    fireEvent.click(screen.getByRole("button", { name: "发送测试消息" }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Architect 回复失败：模型超时").length).toBeGreaterThan(0);
+      expect(screen.getByText("群聊未完成回复")).toBeInTheDocument();
     });
   });
 });

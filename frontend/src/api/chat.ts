@@ -4,6 +4,7 @@ import type {
   Attachment,
   BulkDeleteConversationsResponse,
   Conversation,
+  ConversationUsageSummary,
   ConversationRuntimeMetadata,
   CurrentGroupRuntimeDispatchStrategy,
   CurrentGroupRuntimeEventType,
@@ -15,9 +16,13 @@ import type {
   LlmSettings,
   LlmSettingsUpdate,
   Message,
+  MessageMetaPayload,
   ModelApiFormat,
   ModelConfig,
   ModelConfigPayload,
+  MessageRenderFormat,
+  MessageThinkingPayload,
+  MessageUsagePayload,
   ReservedFutureGroupRuntimeDispatchStrategy,
   ReservedFutureGroupRuntimeEventType,
   SendMessagePayload,
@@ -63,6 +68,8 @@ type BackendConversation = {
   agentId?: string | null;
   sourceConversationId?: string | null;
   modelConfigId?: string | null;
+  usageSummary?: BackendConversationUsageSummary | null;
+  usage_summary?: BackendConversationUsageSummary | null;
   runtimeMetadata?: BackendConversationRuntimeMetadata;
   isDisabled?: boolean;
   createdAt: string;
@@ -147,6 +154,12 @@ type BackendMessage = {
   senderType: "user" | "agent";
   senderId: string;
   content: string;
+  renderFormat?: string | null;
+  render_format?: string | null;
+  thinking?: BackendMessageThinkingPayload | null;
+  usage?: BackendMessageUsagePayload | null;
+  messageMeta?: BackendMessageMetaPayload | null;
+  message_meta?: BackendMessageMetaPayload | null;
   attachments: BackendAttachment[];
   createdAt: string;
 };
@@ -186,6 +199,9 @@ type BackendMessageSendResponse = {
   userMessage: BackendMessage;
   agentMessages: BackendMessage[];
   conversationUpdatedAt: string;
+  usageSummary?: BackendConversationUsageSummary | null;
+  usage_summary?: BackendConversationUsageSummary | null;
+  warnings?: BackendStreamErrorDetail[] | null;
 };
 
 type BackendStreamErrorDetail = {
@@ -207,8 +223,79 @@ type BackendMessageStreamPayload = {
   conversationId: string;
   message?: BackendMessage | null;
   conversationUpdatedAt?: string | null;
+  usageSummary?: BackendConversationUsageSummary | null;
+  usage_summary?: BackendConversationUsageSummary | null;
   error?: BackendStreamErrorDetail | null;
   runtimeHooks?: BackendGroupRuntimeHooks | null;
+  agentId?: string | null;
+  agent_id?: string | null;
+  agentName?: string | null;
+  agent_name?: string | null;
+  toolCallId?: string | null;
+  tool_call_id?: string | null;
+  toolName?: string | null;
+  tool_name?: string | null;
+  toolArgs?: Record<string, unknown> | null;
+  tool_args?: Record<string, unknown> | null;
+  resultPreview?: string | null;
+  result_preview?: string | null;
+};
+
+type BackendMessageThinkingPayload = {
+  available?: boolean;
+  content?: string | null;
+  defaultCollapsed?: boolean;
+  default_collapsed?: boolean;
+};
+
+type BackendMessageUsagePayload = {
+  promptTokens?: number | null;
+  prompt_tokens?: number | null;
+  completionTokens?: number | null;
+  completion_tokens?: number | null;
+  reasoningTokens?: number | null;
+  reasoning_tokens?: number | null;
+  totalTokens?: number | null;
+  total_tokens?: number | null;
+};
+
+type BackendMessageMetaPayload = {
+  provider?: string | null;
+  model?: string | null;
+  agentId?: string | null;
+  agent_id?: string | null;
+  agentName?: string | null;
+  agent_name?: string | null;
+  roundIndex?: number | null;
+  round_index?: number | null;
+};
+
+type BackendConversationUsageSummary = {
+  totalTokens?: number | null;
+  total_tokens?: number | null;
+  totalPromptTokens?: number | null;
+  total_prompt_tokens?: number | null;
+  totalCompletionTokens?: number | null;
+  total_completion_tokens?: number | null;
+  totalReasoningTokens?: number | null;
+  total_reasoning_tokens?: number | null;
+  byAgent?: BackendConversationUsageByAgent[] | null;
+  by_agent?: BackendConversationUsageByAgent[] | null;
+};
+
+type BackendConversationUsageByAgent = {
+  agentId?: string | null;
+  agent_id?: string | null;
+  agentName?: string | null;
+  agent_name?: string | null;
+  totalTokens?: number | null;
+  total_tokens?: number | null;
+  totalPromptTokens?: number | null;
+  total_prompt_tokens?: number | null;
+  totalCompletionTokens?: number | null;
+  total_completion_tokens?: number | null;
+  totalReasoningTokens?: number | null;
+  total_reasoning_tokens?: number | null;
 };
 
 type BackendMessageStreamEvent = {
@@ -280,6 +367,9 @@ function mapConversation(conversation: BackendConversation): Conversation {
     agentId: conversation.agentId ?? undefined,
     sourceConversationId: conversation.sourceConversationId ?? null,
     modelConfigId: conversation.modelConfigId ?? null,
+    usageSummary: mapConversationUsageSummary(
+      conversation.usageSummary ?? conversation.usage_summary ?? null
+    ),
     runtimeMetadata: mapConversationRuntimeMetadata(conversation.runtimeMetadata),
     isDisabled: conversation.isDisabled ?? false,
     createdAt: conversation.createdAt,
@@ -421,13 +511,122 @@ function mapGroupRuntimeHooks(runtimeHooks?: BackendGroupRuntimeHooks | null): G
   };
 }
 
+function coerceNumber(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function mapRenderFormat(renderFormat?: string | null): MessageRenderFormat {
+  return renderFormat === "markdown" ? "markdown" : "plain_text";
+}
+
+function mapThinkingPayload(
+  thinking?: BackendMessageThinkingPayload | null
+): MessageThinkingPayload | undefined {
+  if (!thinking) {
+    return undefined;
+  }
+
+  const content = thinking.content?.trim() ?? "";
+  const available = thinking.available ?? content.length > 0;
+  if (!available && content.length === 0) {
+    return undefined;
+  }
+
+  return {
+    available,
+    content,
+    defaultCollapsed: thinking.defaultCollapsed ?? thinking.default_collapsed ?? true,
+  };
+}
+
+function mapUsagePayload(usage?: BackendMessageUsagePayload | null): MessageUsagePayload | undefined {
+  if (!usage) {
+    return undefined;
+  }
+
+  const promptTokens = coerceNumber(usage.promptTokens ?? usage.prompt_tokens);
+  const completionTokens = coerceNumber(usage.completionTokens ?? usage.completion_tokens);
+  const totalTokens = coerceNumber(usage.totalTokens ?? usage.total_tokens);
+  const reasoningTokens = usage.reasoningTokens ?? usage.reasoning_tokens;
+
+  if (promptTokens === 0 && completionTokens === 0 && totalTokens === 0 && reasoningTokens == null) {
+    return undefined;
+  }
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    reasoningTokens: reasoningTokens == null ? undefined : coerceNumber(reasoningTokens),
+  };
+}
+
+function mapMessageMetaPayload(
+  messageMeta?: BackendMessageMetaPayload | null
+): MessageMetaPayload | undefined {
+  if (!messageMeta) {
+    return undefined;
+  }
+
+  return {
+    provider: messageMeta.provider ?? undefined,
+    model: messageMeta.model ?? undefined,
+    agentId: messageMeta.agentId ?? messageMeta.agent_id ?? undefined,
+    agentName: messageMeta.agentName ?? messageMeta.agent_name ?? undefined,
+    roundIndex: messageMeta.roundIndex ?? messageMeta.round_index ?? undefined,
+  };
+}
+
+function mapConversationUsageSummary(
+  usageSummary?: BackendConversationUsageSummary | null
+): ConversationUsageSummary | null {
+  if (!usageSummary) {
+    return null;
+  }
+
+  const byAgent = usageSummary.byAgent ?? usageSummary.by_agent ?? [];
+  return {
+    totalTokens: coerceNumber(usageSummary.totalTokens ?? usageSummary.total_tokens),
+    totalPromptTokens: coerceNumber(
+      usageSummary.totalPromptTokens ?? usageSummary.total_prompt_tokens
+    ),
+    totalCompletionTokens: coerceNumber(
+      usageSummary.totalCompletionTokens ?? usageSummary.total_completion_tokens
+    ),
+    totalReasoningTokens:
+      usageSummary.totalReasoningTokens ?? usageSummary.total_reasoning_tokens ?? undefined,
+    byAgent: byAgent.map((agentUsage) => ({
+      agentId: agentUsage.agentId ?? agentUsage.agent_id ?? "",
+      agentName: agentUsage.agentName ?? agentUsage.agent_name ?? "",
+      totalTokens: coerceNumber(agentUsage.totalTokens ?? agentUsage.total_tokens),
+      totalPromptTokens: coerceNumber(
+        agentUsage.totalPromptTokens ?? agentUsage.total_prompt_tokens
+      ),
+      totalCompletionTokens: coerceNumber(
+        agentUsage.totalCompletionTokens ?? agentUsage.total_completion_tokens
+      ),
+      totalReasoningTokens:
+        agentUsage.totalReasoningTokens ?? agentUsage.total_reasoning_tokens ?? undefined,
+    })),
+  };
+}
+
 function mapMessage(message: BackendMessage): Message {
+  const renderFormatValue = message.renderFormat ?? message.render_format;
   return {
     id: message.id,
     conversationId: message.conversationId,
     senderType: message.senderType,
     senderId: message.senderId,
     content: message.content,
+    renderFormat: renderFormatValue
+      ? mapRenderFormat(renderFormatValue)
+      : message.senderType === "agent"
+        ? "markdown"
+        : "plain_text",
+    thinking: mapThinkingPayload(message.thinking),
+    usage: mapUsagePayload(message.usage),
+    messageMeta: mapMessageMetaPayload(message.messageMeta ?? message.message_meta),
     attachments: message.attachments.map(mapAttachment),
     createdAt: message.createdAt,
   };
@@ -703,12 +902,20 @@ export function sendMessage(payload: SendMessagePayload) {
         conversationId: payload.conversationId,
         content: payload.content,
         attachments: (payload.attachments ?? []).map(mapAttachmentToRequest),
+        options: payload.options,
       },
     });
     return {
       userMessage: mapMessage(response.userMessage),
       agentMessages: response.agentMessages.map(mapMessage),
       conversationUpdatedAt: response.conversationUpdatedAt,
+      usageSummary: mapConversationUsageSummary(
+        response.usageSummary ?? response.usage_summary ?? null
+      ),
+      warnings: (response.warnings ?? []).map((warning) => ({
+        code: warning.code,
+        message: warning.message,
+      })),
     } satisfies SendMessageResponse;
   }, "发送消息失败");
 }
@@ -737,6 +944,9 @@ export function sendGroupMessageStream(
               conversationId: payloadData.conversationId,
               message: mapMessage(payloadData.message),
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              usageSummary: mapConversationUsageSummary(
+                payloadData.usageSummary ?? payloadData.usage_summary ?? null
+              ),
               runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
             },
           });
@@ -748,6 +958,9 @@ export function sendGroupMessageStream(
             payload: {
               conversationId: payloadData.conversationId,
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              usageSummary: mapConversationUsageSummary(
+                payloadData.usageSummary ?? payloadData.usage_summary ?? null
+              ),
               error: {
                 code: payloadData.error?.code,
                 message: payloadData.error?.message ?? "群聊运行失败",
@@ -767,6 +980,9 @@ export function sendGroupMessageStream(
             payload: {
               conversationId: payloadData.conversationId,
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              usageSummary: mapConversationUsageSummary(
+                payloadData.usageSummary ?? payloadData.usage_summary ?? null
+              ),
               runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
             },
           });
@@ -778,6 +994,9 @@ export function sendGroupMessageStream(
             payload: {
               conversationId: payloadData.conversationId,
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              usageSummary: mapConversationUsageSummary(
+                payloadData.usageSummary ?? payloadData.usage_summary ?? null
+              ),
               runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
               agentId: payloadData.agentId ?? payloadData.agent_id ?? "",
               agentName: payloadData.agentName ?? payloadData.agent_name ?? "",
@@ -794,8 +1013,12 @@ export function sendGroupMessageStream(
             payload: {
               conversationId: payloadData.conversationId,
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              usageSummary: mapConversationUsageSummary(
+                payloadData.usageSummary ?? payloadData.usage_summary ?? null
+              ),
               runtimeHooks: mapGroupRuntimeHooks(payloadData.runtimeHooks),
               agentId: payloadData.agentId ?? payloadData.agent_id ?? "",
+              agentName: payloadData.agentName ?? payloadData.agent_name ?? "",
               toolCallId: payloadData.toolCallId ?? payloadData.tool_call_id ?? "",
               toolName: payloadData.toolName ?? payloadData.tool_name ?? "",
               resultPreview: payloadData.resultPreview ?? payloadData.result_preview ?? "",
@@ -810,6 +1033,9 @@ export function sendGroupMessageStream(
               conversationId: payloadData.conversationId,
               message: payloadData.message ? mapMessage(payloadData.message) : undefined,
               conversationUpdatedAt: payloadData.conversationUpdatedAt ?? null,
+              usageSummary: mapConversationUsageSummary(
+                payloadData.usageSummary ?? payloadData.usage_summary ?? null
+              ),
               error: payloadData.error
                 ? {
                     code: payloadData.error.code,

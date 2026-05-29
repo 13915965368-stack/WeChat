@@ -62,9 +62,40 @@ describe("MessageComposer 图片能力", () => {
     fireEvent.click(screen.getByLabelText("发送消息"));
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("带图消息", [file]);
+      expect(onSend).toHaveBeenCalledWith("带图消息", [file], undefined);
     });
 
     expect(screen.queryByAltText("demo.png")).not.toBeInTheDocument();
+  });
+
+  it("单聊下展示 thinking 开关并透传当前状态", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <MessageComposer
+        onSend={onSend}
+        showThinkingToggle
+        thinkingEnabled
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("消息输入"), { target: { value: "带 thinking 的消息" } });
+    fireEvent.click(screen.getByLabelText("已开启 thinking"));
+
+    expect(screen.getByLabelText("已开启 thinking")).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByLabelText("发送消息"));
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith("带 thinking 的消息", [], {
+        thinkingEnabled: true,
+      });
+    });
+  });
+
+  it("群聊下不展示 thinking 开关", () => {
+    render(<MessageComposer onSend={vi.fn()} showThinkingToggle={false} />);
+
+    expect(screen.queryByText("Think")).not.toBeInTheDocument();
   });
 });

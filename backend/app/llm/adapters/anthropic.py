@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 
 from app.llm.adapters.base import BaseLLMAdapter
+from app.llm.protocols.common import build_thinking_provider_overrides
 from app.llm.schemas import ChatMessage, ChatRequest, ChatResponse, ToolCall, ValidationRequest, ValidationResult
+from app.llm.usage import normalize_usage
 from app.llm.validator import (
     LLMStreamInterruptedError,
     LLMStreamProtocolError,
@@ -42,6 +44,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             payload["system"] = system_prompt
         if stream:
             payload["stream"] = True
+        payload.update(build_thinking_provider_overrides(request))
 
         if request.tools:
             payload["tools"] = [
@@ -117,6 +120,10 @@ class AnthropicAdapter(BaseLLMAdapter):
 
     def _build_chat_response(self, validated: ChatRequest, data: dict[str, object]) -> ChatResponse:
         tool_calls = self._extract_tool_calls(data)
+        usage = normalize_usage(data.get("usage"))
+        raw: dict[str, object] = {"adapter": self.adapter_name, "mode": "remote"}
+        if usage is not None:
+            raw["usage"] = data.get("usage")
         if tool_calls:
             content = self._extract_text_content(data.get("content", ""))
             return ChatResponse(
@@ -124,14 +131,16 @@ class AnthropicAdapter(BaseLLMAdapter):
                 provider=validated.config.provider,
                 model=validated.config.model,
                 tool_calls=tool_calls,
-                raw={"adapter": self.adapter_name, "mode": "remote"},
+                raw=raw,
+                usage=usage,
             )
 
         return ChatResponse(
             content=self._extract_response_text(data),
             provider=validated.config.provider,
             model=validated.config.model,
-            raw={"adapter": self.adapter_name, "mode": "remote"},
+            raw=raw,
+            usage=usage,
         )
 
     def _finalize_stream_tool_calls(self, tool_buffers: dict[int, dict[str, str]]) -> list[ToolCall]:
@@ -211,8 +220,8 @@ class AnthropicAdapter(BaseLLMAdapter):
                         continue
                     delta_type = delta.get("type")
                     if delta_type == "text_delta":
-                        text = str(delta.get("text", "")).strip()
-                        if text:
+                        text = str(delta.get("text", ""))
+                        if text != "":
                             text_parts.append(text)
                             had_effective_increment = True
                     elif delta_type == "input_json_delta":
@@ -253,6 +262,7 @@ class AnthropicAdapter(BaseLLMAdapter):
             finish_reason=finish_reason,
             raw=raw,
             tool_calls=tool_calls,
+            usage=normalize_usage(raw.get("usage")),
         )
 
     def validate(self, request: ValidationRequest | None = None) -> ValidationResult:

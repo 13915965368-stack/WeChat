@@ -6,6 +6,7 @@ from typing import Any, Iterator
 
 import httpx
 
+from app.llm.protocols.agents import build_agent_local_reply
 from app.llm.schemas import ChatRequest, ChatResponse, ValidationRequest, ValidationResult
 from app.llm.validator import (
     LLMStreamProtocolError,
@@ -13,12 +14,6 @@ from app.llm.validator import (
     validate_chat_request,
     validate_validation_request,
 )
-
-STYLE_PREFIX = {
-    "architect": "我先从结构上拆一下：",
-    "critic": "我先提醒几个风险点：",
-    "writer": "我先帮你整理表达：",
-}
 
 IMAGE_INPUT_HINTS = ("image", "image_url", "vision", "multimodal")
 UNSUPPORTED_HINTS = (
@@ -30,38 +25,6 @@ UNSUPPORTED_HINTS = (
     "not enabled",
     "cannot process",
 )
-
-
-def build_local_reply(
-    agent_id: str,
-    agent_name: str,
-    user_text: str,
-    is_group: bool,
-    *,
-    has_system_prompt: bool = False,
-    history_count: int = 0,
-) -> str:
-    prefix = STYLE_PREFIX.get(agent_id, f"{agent_name}：")
-    if agent_id == "architect":
-        suffix = f"先把问题拆成几个可执行部分，再围绕“{user_text}”推进。"
-    elif agent_id == "critic":
-        suffix = f"这件事里最需要先看的，是“{user_text}”背后的风险和边界。"
-    elif agent_id == "writer":
-        suffix = f"我先帮你把“{user_text}”整理成更顺的表达，再往下展开。"
-    else:
-        suffix = f"我先围绕“{user_text}”给出一个可执行回应。"
-    context_hints = []
-    if has_system_prompt:
-        context_hints.append("已参考系统提示词")
-    if history_count > 0:
-        context_hints.append(f"已参考{history_count}条历史消息")
-
-    reply = f"{prefix}{suffix}" if not is_group else f"{agent_name}：{prefix}{suffix}"
-    if not context_hints:
-        return reply
-    return f"{reply}（{'，'.join(context_hints)}）"
-
-
 class BaseLLMAdapter(ABC):
     adapter_name = "base"
     request_timeout = 60.0
@@ -89,7 +52,7 @@ class BaseLLMAdapter(ABC):
         has_system_prompt = any(message.role == "system" for message in validated.messages)
         history_count = max(sum(1 for message in validated.messages if message.role != "system") - 1, 0)
         return ChatResponse(
-            content=build_local_reply(
+            content=build_agent_local_reply(
                 agent_id=validated.agent_id,
                 agent_name=validated.agent_name,
                 user_text=validated.user_text,
@@ -280,21 +243,24 @@ class BaseLLMAdapter(ABC):
         system_prompt = "\n\n".join(system_parts).strip()
         return (system_prompt or None, messages)
 
-    def _extract_text_content(self, value: Any) -> str:
+    def _extract_text_content(self, value: Any, *, strip: bool = True) -> str:
         if isinstance(value, str):
-            return value.strip()
+            return value.strip() if strip else value
         if isinstance(value, list):
             parts: list[str] = []
             for item in value:
                 if isinstance(item, str):
-                    text = item.strip()
+                    text = item.strip() if strip else item
                 elif isinstance(item, dict):
-                    text = str(item.get("text", "")).strip()
+                    raw_text = str(item.get("text", ""))
+                    text = raw_text.strip() if strip else raw_text
                 else:
                     text = ""
-                if text:
+                if text if strip else text != "":
                     parts.append(text)
-            return "\n".join(parts).strip()
+            joined = "\n".join(parts)
+            return joined.strip() if strip else joined
         if isinstance(value, dict):
-            return str(value.get("text", "")).strip()
+            raw_text = str(value.get("text", ""))
+            return raw_text.strip() if strip else raw_text
         return ""

@@ -92,4 +92,5 @@ def validate_chat_request(request: ChatRequest) -> ChatRequest:
         messages=normalized_messages,
         user_text=user_text,
         system_prompt=request.system_prompt.strip(),
+        thinking=request.thinking,
     )

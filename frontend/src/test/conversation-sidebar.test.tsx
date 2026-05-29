@@ -66,6 +66,15 @@ const messages: Message[] = [
     content: "已置顶群聊的最后一条消息",
     createdAt: "2026-05-18T09:00:00.000Z",
   },
+  {
+    id: "msg-2",
+    conversationId: "conv-normal",
+    senderType: "agent",
+    senderId: "architect",
+    content: "<think>不应泄露的推理</think>\n# 最终建议",
+    renderFormat: "markdown",
+    createdAt: "2026-05-18T08:20:00.000Z",
+  },
 ];
 
 function renderSidebar() {
@@ -140,5 +149,12 @@ describe("ConversationSidebar", () => {
     fireEvent.click(screen.getByRole("button", { name: "新建 Agent" }));
 
     expect(onCreateAgent).toHaveBeenCalled();
+  });
+
+  it("会话预览使用清洗后的安全摘要，不泄露 think 内容", () => {
+    renderSidebar();
+
+    expect(screen.getByText("最终建议")).toBeInTheDocument();
+    expect(screen.queryByText(/不应泄露的推理/)).not.toBeInTheDocument();
   });
 });

@@ -95,6 +95,46 @@ export type ModelConfigPayload = {
 
 export type ConversationType = 'direct' | 'group';
 
+export type MessageRenderFormat = "plain_text" | "markdown";
+
+export type MessageThinkingPayload = {
+  available: boolean;
+  content: string;
+  defaultCollapsed: boolean;
+};
+
+export type MessageUsagePayload = {
+  promptTokens: number;
+  completionTokens: number;
+  reasoningTokens?: number;
+  totalTokens: number;
+};
+
+export type MessageMetaPayload = {
+  provider?: string;
+  model?: string;
+  agentId?: string;
+  agentName?: string;
+  roundIndex?: number;
+};
+
+export type ConversationUsageByAgent = {
+  agentId: string;
+  agentName: string;
+  totalTokens: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalReasoningTokens?: number;
+};
+
+export type ConversationUsageSummary = {
+  totalTokens: number;
+  totalPromptTokens: number;
+  totalCompletionTokens: number;
+  totalReasoningTokens?: number;
+  byAgent: ConversationUsageByAgent[];
+};
+
 export type GroupRuntimeEvent = {
   eventId: string;
   eventType: string;
@@ -174,6 +214,7 @@ export type Conversation = {
   sourceConversationId?: string | null; // 仅 group 可用，表示来源直聊
   modelConfigId?: string | null; // 用于空白对话等会话级模型覆盖
   runtimeMetadata?: ConversationRuntimeMetadata;
+  usageSummary?: ConversationUsageSummary | null;
   isDisabled?: boolean;
   createdAt: string;
   updatedAt: string;
@@ -187,6 +228,10 @@ export type Message = {
   senderType: 'user' | 'agent';
   senderId: string;
   content: string;
+  renderFormat?: MessageRenderFormat;
+  thinking?: MessageThinkingPayload;
+  usage?: MessageUsagePayload;
+  messageMeta?: MessageMetaPayload;
   attachments?: Attachment[];
   createdAt: string;
 };
@@ -211,6 +256,8 @@ export type SendMessageResponse = {
   userMessage: Message;
   agentMessages: Message[];
   conversationUpdatedAt: string;
+  usageSummary?: ConversationUsageSummary | null;
+  warnings?: StreamErrorDetail[];
 };
 
 export type StreamErrorDetail = {
@@ -228,6 +275,7 @@ export type ToolCallPayload = {
 
 export type ToolResultPayload = {
   agentId: string;
+  agentName: string;
   toolCallId: string;
   toolName: string;
   resultPreview: string;
@@ -275,6 +323,7 @@ export type GroupRuntimeHooks = {
 type GroupMessageStreamPayloadBase = {
   conversationId: string;
   conversationUpdatedAt?: string | null;
+  usageSummary?: ConversationUsageSummary | null;
   runtimeHooks?: GroupRuntimeHooks | null;
 };
 
@@ -328,6 +377,11 @@ export type SendMessagePayload = {
   conversationId: string;
   content: string;
   attachments?: Attachment[];
+  options?: {
+    thinking?: {
+      enabled: boolean;
+    };
+  };
 };
 
 export type ImageAttachmentUploadResponse = {

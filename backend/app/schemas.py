@@ -93,12 +93,54 @@ class AttachmentResponse(APIModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MessageThinkingPayload(APIModel):
+    available: bool
+    content: str
+    default_collapsed: bool = Field(alias="defaultCollapsed")
+
+
+class MessageUsagePayload(APIModel):
+    prompt_tokens: int = Field(alias="promptTokens")
+    completion_tokens: int = Field(alias="completionTokens")
+    reasoning_tokens: int | None = Field(default=None, alias="reasoningTokens")
+    total_tokens: int = Field(alias="totalTokens")
+
+
+class MessageMetaPayload(APIModel):
+    provider: str | None = None
+    model: str | None = None
+    agent_id: str | None = Field(default=None, alias="agentId")
+    agent_name: str | None = Field(default=None, alias="agentName")
+    round_index: int | None = Field(default=None, alias="roundIndex")
+
+
+class ConversationUsageByAgent(APIModel):
+    agent_id: str = Field(alias="agentId")
+    agent_name: str = Field(alias="agentName")
+    total_tokens: int = Field(alias="totalTokens")
+    total_prompt_tokens: int = Field(alias="totalPromptTokens")
+    total_completion_tokens: int = Field(alias="totalCompletionTokens")
+    total_reasoning_tokens: int | None = Field(default=None, alias="totalReasoningTokens")
+
+
+class ConversationUsageSummary(APIModel):
+    total_tokens: int = Field(alias="totalTokens")
+    total_prompt_tokens: int = Field(alias="totalPromptTokens")
+    total_completion_tokens: int = Field(alias="totalCompletionTokens")
+    total_reasoning_tokens: int | None = Field(default=None, alias="totalReasoningTokens")
+    by_agent: list[ConversationUsageByAgent] = Field(default_factory=list, alias="byAgent")
+
+
 class MessageResponse(APIModel):
     id: str
     conversation_id: str
     sender_type: str
     sender_id: str
     content: str
+    render_format: str = Field(default="plain_text", alias="renderFormat")
+    thinking: MessageThinkingPayload | None = None
+    usage: MessageUsagePayload | None = None
+    message_meta: MessageMetaPayload | None = Field(default=None, alias="messageMeta")
     attachments: list[AttachmentResponse] = Field(default_factory=list)
     created_at: str
 
@@ -108,6 +150,10 @@ class MessagesPageResponse(APIModel):
     limit: int
     offset: int
     has_more: bool
+    conversation_usage_summary: ConversationUsageSummary | None = Field(
+        default=None,
+        alias="conversationUsageSummary",
+    )
 
 
 class DirectConversationCreate(APIModel):
@@ -124,16 +170,29 @@ class GroupConversationCreate(APIModel):
     context_rounds: int = Field(default=0, alias="contextRounds")
 
 
+class MessageThinkingOptionsRequest(APIModel):
+    enabled: bool = False
+
+
+class MessageOptionsRequest(APIModel):
+    thinking: MessageThinkingOptionsRequest | None = None
+
+
 class MessageCreate(APIModel):
     conversation_id: str = Field(alias="conversationId")
     content: str
     attachments: list[AttachmentResponse] = Field(default_factory=list)
+    options: MessageOptionsRequest | None = None
 
 
 class MessageSendResponse(APIModel):
     user_message: MessageResponse
     agent_messages: list[MessageResponse]
     conversation_updated_at: str
+    conversation_usage_summary: ConversationUsageSummary | None = Field(
+        default=None,
+        alias="conversationUsageSummary",
+    )
     warnings: list[ErrorDetail] = Field(default_factory=list)
 
 
@@ -180,6 +239,16 @@ class MessageStreamPayload(APIModel):
     conversation_id: str
     message: MessageResponse | None = None
     conversation_updated_at: str | None = None
+    conversation_usage_summary: ConversationUsageSummary | None = Field(
+        default=None,
+        alias="conversationUsageSummary",
+    )
+    agent_id: str | None = Field(default=None, alias="agentId")
+    agent_name: str | None = Field(default=None, alias="agentName")
+    tool_call_id: str | None = Field(default=None, alias="toolCallId")
+    tool_name: str | None = Field(default=None, alias="toolName")
+    tool_args: dict[str, object] | None = Field(default=None, alias="toolArgs")
+    result_preview: str | None = Field(default=None, alias="resultPreview")
     error: ErrorDetail | None = None
     runtime_hooks: MessageStreamRuntimeHooks | None = None
 

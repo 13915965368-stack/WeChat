@@ -8,13 +8,20 @@ type ComposerImage = {
 };
 
 type Props = {
-  onSend: (content: string, imageFiles: File[]) => Promise<void> | void;
+  onSend: (
+    content: string,
+    imageFiles: File[],
+    options?: { thinkingEnabled?: boolean }
+  ) => Promise<void> | void;
   canSend?: boolean;
   sendDisabledReason?: string;
   canAttachImage?: boolean;
   imageCapabilityReason?: string;
   maxImageCount?: number | null;
   maxImageSizeMb?: number | null;
+  showThinkingToggle?: boolean;
+  thinkingEnabled?: boolean;
+  onToggleThinking?: () => void;
 };
 
 export function MessageComposer({
@@ -25,6 +32,9 @@ export function MessageComposer({
   imageCapabilityReason,
   maxImageCount = 5,
   maxImageSizeMb = 10,
+  showThinkingToggle = false,
+  thinkingEnabled = false,
+  onToggleThinking,
 }: Props) {
   const [value, setValue] = useState("");
   const [selectedImages, setSelectedImages] = useState<ComposerImage[]>([]);
@@ -60,7 +70,8 @@ export function MessageComposer({
     try {
       await onSend(
         trimmed,
-        selectedImages.map((image) => image.file)
+        selectedImages.map((image) => image.file),
+        showThinkingToggle ? { thinkingEnabled } : undefined
       );
       selectedImages.forEach((image) => URL.revokeObjectURL(image.previewUrl));
       setSelectedImages([]);
@@ -195,6 +206,23 @@ export function MessageComposer({
       >
         {/* 左侧功能图标组 */}
         <div className="flex items-center gap-1">
+          {showThinkingToggle ? (
+            <button
+              type="button"
+              onClick={onToggleThinking}
+              className="flex h-8 min-w-[54px] items-center justify-center rounded-lg border px-2 text-[11px] font-medium transition-all duration-200 hover:bg-white/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5B7BA3]/40"
+              style={{
+                color: thinkingEnabled ? "#5B7BA3" : "var(--text-tertiary)",
+                borderColor: thinkingEnabled ? "#B9C9DD" : "transparent",
+                background: thinkingEnabled ? "rgba(91, 123, 163, 0.10)" : "transparent",
+              }}
+              title={thinkingEnabled ? "已开启 thinking" : "开启 thinking"}
+              aria-label={thinkingEnabled ? "已开启 thinking" : "开启 thinking"}
+              aria-pressed={thinkingEnabled}
+            >
+              Think
+            </button>
+          ) : null}
           {/* 图片上传 */}
           <button
             type="button"

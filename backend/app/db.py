@@ -57,6 +57,10 @@ def ensure_sqlite_schema(engine: Engine) -> None:
             "pinned_at": "ALTER TABLE conversations ADD COLUMN pinned_at VARCHAR(40)",
         },
         "messages": {
+            "render_format": "ALTER TABLE messages ADD COLUMN render_format VARCHAR(32) NOT NULL DEFAULT 'plain_text'",
+            "thinking_payload": "ALTER TABLE messages ADD COLUMN thinking_payload TEXT NOT NULL DEFAULT '{}'",
+            "usage_payload": "ALTER TABLE messages ADD COLUMN usage_payload TEXT NOT NULL DEFAULT '{}'",
+            "message_meta": "ALTER TABLE messages ADD COLUMN message_meta TEXT NOT NULL DEFAULT '{}'",
             "attachments": "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
         },
     }

@@ -3,7 +3,12 @@ from __future__ import annotations
 import json
 
 from app.llm.adapters.base import BaseLLMAdapter
+from app.llm.protocols.common import (
+    build_response_format_provider_overrides,
+    build_thinking_provider_overrides,
+)
 from app.llm.schemas import ChatRequest, ChatResponse, ToolCall, ValidationRequest, ValidationResult
+from app.llm.usage import normalize_usage
 from app.llm.validator import (
     LLMStreamInterruptedError,
     LLMStreamProtocolError,
@@ -43,6 +48,10 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             payload["max_tokens"] = max_tokens
         if stream:
             payload["stream"] = True
+            if request.config.provider.strip().lower() in {"qwen", "dashscope", "minimax", "moonshot", "kimi"}:
+                payload["stream_options"] = {"include_usage": True}
+        payload.update(build_thinking_provider_overrides(request))
+        payload.update(build_response_format_provider_overrides(request))
 
         if request.tools:
             payload["tools"] = [
@@ -134,8 +143,24 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             raise ValueError("openai-compatible response missing assistant content")
         return content
 
+    def _extract_reasoning_content(self, payload: dict[str, object]) -> str:
+        for key in ("reasoning_content", "reasoning", "reasoning_details"):
+            reasoning = self._extract_text_content(payload.get(key, ""))
+            if reasoning:
+                return reasoning
+        return ""
+
     def _build_chat_response(self, validated: ChatRequest, data: dict[str, object]) -> ChatResponse:
         tool_calls = self._extract_tool_calls(data)
+        raw: dict[str, object] = {"adapter": self.adapter_name, "mode": "remote"}
+        reasoning_content = self._extract_reasoning_content(
+            self._extract_message_payload(self._extract_first_choice(data))
+        )
+        if reasoning_content:
+            raw["reasoning_content"] = reasoning_content
+        usage = normalize_usage(data.get("usage"))
+        if usage is not None:
+            raw["usage"] = data.get("usage")
         if tool_calls:
             content = self._extract_text_content(
                 self._extract_message_payload(self._extract_first_choice(data)).get("content", "")
@@ -146,7 +171,8 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                 model=validated.config.model,
                 tool_calls=tool_calls,
                 finish_reason=str(self._extract_first_choice(data).get("finish_reason", "stop") or "stop"),
-                raw={"adapter": self.adapter_name, "mode": "remote"},
+                raw=raw,
+                usage=usage,
             )
 
         return ChatResponse(
@@ -154,7 +180,8 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             provider=validated.config.provider,
             model=validated.config.model,
             finish_reason=str(self._extract_first_choice(data).get("finish_reason", "stop") or "stop"),
-            raw={"adapter": self.adapter_name, "mode": "remote"},
+            raw=raw,
+            usage=usage,
         )
 
     def _finalize_stream_tool_calls(self, tool_buffers: dict[int, dict[str, str]]) -> list[ToolCall]:
@@ -178,6 +205,21 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             )
         return result
 
+    def _extract_stream_usage(self, event: dict[str, object]) -> dict[str, object] | None:
+        usage_candidates: list[object] = [event.get("usage")]
+        choices = event.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0]
+            if isinstance(first_choice, dict):
+                usage_candidates.append(first_choice.get("usage"))
+                delta = first_choice.get("delta")
+                if isinstance(delta, dict):
+                    usage_candidates.append(delta.get("usage"))
+        for usage in usage_candidates:
+            if isinstance(usage, dict) and usage:
+                return usage
+        return None
+
     def _chat_stream(self, validated: ChatRequest) -> ChatResponse:
         payload = self._build_payload(validated, stream=True)
         text_parts: list[str] = []
@@ -185,6 +227,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
         tool_buffers: dict[int, dict[str, str]] = {}
         finish_reason = "stop"
         had_effective_increment = False
+        usage_payload: dict[str, object] | None = None
 
         try:
             for event in self._stream_sse_events(
@@ -192,6 +235,9 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                 payload,
                 self._build_headers(),
             ):
+                usage = self._extract_stream_usage(event)
+                if usage is not None:
+                    usage_payload = usage
                 choices = event.get("choices")
                 if not isinstance(choices, list) or not choices:
                     continue
@@ -201,11 +247,11 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
                 delta = first_choice.get("delta", {})
                 if not isinstance(delta, dict):
                     delta = {}
-                content = self._extract_text_content(delta.get("content", ""))
-                if content:
+                content = self._extract_text_content(delta.get("content", ""), strip=False)
+                if content != "":
                     text_parts.append(content)
                     had_effective_increment = True
-                reasoning = self._extract_text_content(delta.get("reasoning_content", ""))
+                reasoning = self._extract_reasoning_content(delta)
                 if reasoning:
                     reasoning_parts.append(reasoning)
                     had_effective_increment = True
@@ -250,6 +296,9 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
         raw: dict[str, object] = {"adapter": self.adapter_name, "mode": "remote"}
         if reasoning_parts:
             raw["reasoning_content"] = "".join(reasoning_parts).strip()
+        usage = normalize_usage(usage_payload)
+        if usage_payload is not None:
+            raw["usage"] = usage_payload
 
         return ChatResponse(
             content=content,
@@ -258,6 +307,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
             finish_reason=finish_reason,
             raw=raw,
             tool_calls=tool_calls,
+            usage=usage,
         )
 
     def _extract_first_choice(self, data: dict[str, object]) -> dict[str, object]:
@@ -282,7 +332,7 @@ class OpenAICompatibleAdapter(BaseLLMAdapter):
 
         if self._extract_text_content(message.get("content", "")):
             return True
-        if self._extract_text_content(message.get("reasoning_content", "")):
+        if self._extract_reasoning_content(message):
             return True
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and len(tool_calls) > 0:

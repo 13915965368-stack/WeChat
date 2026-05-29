@@ -53,6 +53,10 @@ type PendingReply = {
 
 type ComposerTargetAgent = Agent | null;
 
+type ComposerSendOptions = {
+  thinkingEnabled?: boolean;
+};
+
 const BUSINESS_ERROR_MESSAGES: Record<string, string> = {
   IMAGE_NOT_SUPPORTED: "当前模型不支持图片输入，请切换到支持图片的模型后再试。",
 };
@@ -150,7 +154,7 @@ export default function App() {
   const [createModalMode, setCreateModalMode] = useState<"blank" | "context">("blank");
   const [middlePanel, setMiddlePanel] = useState<MiddlePanelState>({ type: "profile" });
   const [activeTool, setActiveTool] = useState<string | null>(null);
-  const { activities: toolActivities, handleToolCall, handleToolResult, clearActivities } = useToolActivities();
+  const { activities: toolActivities, handleToolCall, handleToolResult } = useToolActivities();
   const [isModelPickerOpen, setIsModelPickerOpen] = useState(false);
   const [isCreatingBlankConversation, setIsCreatingBlankConversation] = useState(false);
   const [isCreateAgentModalOpen, setIsCreateAgentModalOpen] = useState(false);
@@ -160,6 +164,8 @@ export default function App() {
   const [modelConfigError, setModelConfigError] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [directThinkingEnabledByConversationId, setDirectThinkingEnabledByConversationId] =
+    useState<Record<string, boolean>>({});
 
   const pendingTimeoutsRef = useRef<PendingReply[]>([]);
   const activeConversationIdRef = useRef(activeConversationId);
@@ -757,7 +763,24 @@ export default function App() {
     });
   }
 
-  async function handleSendRequest(content: string, imageFiles: File[] = []) {
+  function updateConversationUsageSummary(conversationId: string, usageSummary?: Conversation["usageSummary"]) {
+    if (!usageSummary) {
+      return;
+    }
+    setConversations((prev) =>
+      prev.map((conversation) =>
+        conversation.id === conversationId
+          ? { ...conversation, usageSummary }
+          : conversation
+      )
+    );
+  }
+
+  async function handleSendRequest(
+    content: string,
+    imageFiles: File[] = [],
+    options?: ComposerSendOptions
+  ) {
     clearPendingReplies();
     if (!activeConversation) return;
 
@@ -820,12 +843,18 @@ export default function App() {
         let deliveredAgentReply = false;
         const streamErrorMessages: string[] = [];
 
-        const syncConversationUpdatedAt = (updatedAt?: string | null) => {
+        const syncConversationUpdatedAt = (
+          updatedAt?: string | null,
+          usageSummary?: Conversation["usageSummary"]
+        ) => {
+          if (usageSummary) {
+            updateConversationUsageSummary(targetConversationId, usageSummary);
+          }
           if (!updatedAt) return;
           setConversations((prev) =>
             prev.map((conversation) =>
               conversation.id === targetConversationId
-                ? { ...conversation, updatedAt }
+                ? { ...conversation, updatedAt, usageSummary: usageSummary ?? conversation.usageSummary }
                 : conversation
             )
           );
@@ -847,30 +876,48 @@ export default function App() {
                 setMessages((prev) =>
                   replaceOptimisticMessage(prev, tempMessageId, event.payload.message)
                 );
-                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                syncConversationUpdatedAt(
+                  event.payload.conversationUpdatedAt,
+                  event.payload.usageSummary
+                );
                 break;
               case "agent_message":
                 deliveredAgentReply = true;
                 setMessages((prev) => mergeMessageList(prev, event.payload.message));
-                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                syncConversationUpdatedAt(
+                  event.payload.conversationUpdatedAt,
+                  event.payload.usageSummary
+                );
                 break;
               case "conversation_updated":
               case "done":
-                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                syncConversationUpdatedAt(
+                  event.payload.conversationUpdatedAt,
+                  event.payload.usageSummary
+                );
                 break;
               case "error":
                 if (event.payload.error.message.trim()) {
                   streamErrorMessages.push(event.payload.error.message.trim());
                 }
-                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                syncConversationUpdatedAt(
+                  event.payload.conversationUpdatedAt,
+                  event.payload.usageSummary
+                );
                 break;
               case "tool_call":
                 handleToolCall(event.payload);
-                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                syncConversationUpdatedAt(
+                  event.payload.conversationUpdatedAt,
+                  event.payload.usageSummary
+                );
                 break;
               case "tool_result":
                 handleToolResult(event.payload);
-                syncConversationUpdatedAt(event.payload.conversationUpdatedAt);
+                syncConversationUpdatedAt(
+                  event.payload.conversationUpdatedAt,
+                  event.payload.usageSummary
+                );
                 break;
               default:
                 break;
@@ -906,17 +953,47 @@ export default function App() {
         conversationId: targetConversationId,
         content,
         attachments: uploadedAttachments.length > 0 ? uploadedAttachments : undefined,
+        options:
+          activeConversation.type === "direct"
+            ? {
+                thinking: {
+                  enabled: options?.thinkingEnabled ?? false,
+                },
+              }
+            : undefined,
       });
 
       setMessages((prev) =>
         replaceOptimisticMessage(prev, tempMessageId, result.userMessage)
       );
+      updateConversationUsageSummary(targetConversationId, result.usageSummary);
+      if ((result.warnings?.length ?? 0) > 0) {
+        const warningMessage = Array.from(
+          new Set(
+            (result.warnings ?? [])
+              .map((warning) => warning.message.trim())
+              .filter(Boolean)
+          )
+        ).join("\n");
+        if (warningMessage) {
+          setErrorMessage(warningMessage);
+          pushToast({
+            title: result.agentMessages.length > 0 ? "部分成员回复失败" : "未生成可展示回复",
+            description: warningMessage,
+            tone: result.agentMessages.length > 0 ? "warning" : "error",
+          });
+        }
+      }
 
       if (result.agentMessages.length === 0) {
         setConversations((prev) =>
           prev.map((conversation) =>
             conversation.id === targetConversationId
-              ? { ...conversation, updatedAt: result.conversationUpdatedAt }
+              ? {
+                  ...conversation,
+                  updatedAt: result.conversationUpdatedAt,
+                  usageSummary: result.usageSummary ?? conversation.usageSummary,
+                }
               : conversation
           )
         );
@@ -946,8 +1023,8 @@ export default function App() {
     }
   }
 
-  function handleSend(content: string, imageFiles: File[] = []) {
-    void handleSendRequest(content, imageFiles);
+  function handleSend(content: string, imageFiles: File[] = [], options?: ComposerSendOptions) {
+    void handleSendRequest(content, imageFiles, options);
   }
 
   async function handleCreateGroup(title: string, memberIds: string[], historyRounds: number) {
@@ -1133,6 +1210,71 @@ export default function App() {
     }
 
     setIsModelPickerOpen(true);
+  }
+
+  const isDirectThinkingEnabled =
+    activeConversation?.type === "direct"
+      ? (directThinkingEnabledByConversationId[activeConversation.id] ?? false)
+      : false;
+
+  function handleToggleDirectThinking() {
+    if (activeConversation?.type !== "direct") {
+      return;
+    }
+    setDirectThinkingEnabledByConversationId((prev) => ({
+      ...prev,
+      [activeConversation.id]: !(prev[activeConversation.id] ?? false),
+    }));
+  }
+
+  function renderConversationUsageSummary() {
+    const usageSummary = activeConversation?.usageSummary;
+    if (!usageSummary) {
+      return null;
+    }
+
+    return (
+      <div
+        className="mt-4 rounded-2xl border px-4 py-3"
+        style={{
+          background: "var(--bg-secondary)",
+          borderColor: "var(--border-light)",
+        }}
+      >
+        <div className="flex flex-wrap items-center gap-2 text-xs" style={{ color: "var(--text-secondary)" }}>
+          <span className="font-medium text-[#2D2926]">Usage 摘要</span>
+          <span>总计 {usageSummary.totalTokens} tokens</span>
+          <span>输入 {usageSummary.totalPromptTokens}</span>
+          <span>输出 {usageSummary.totalCompletionTokens}</span>
+          {typeof usageSummary.totalReasoningTokens === "number" ? (
+            <span>思考 {usageSummary.totalReasoningTokens}</span>
+          ) : null}
+        </div>
+        {activeConversation?.type === "group" && usageSummary.byAgent.length > 0 ? (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {usageSummary.byAgent.map((agentUsage) => (
+              <div
+                key={`${agentUsage.agentId}-${agentUsage.agentName}`}
+                className="rounded-xl border px-3 py-2 text-xs"
+                style={{
+                  background: "var(--bg-card)",
+                  borderColor: "var(--border-light)",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                <span className="font-medium text-[#2D2926]">{agentUsage.agentName}</span>
+                <span>{` · 总 ${agentUsage.totalTokens}`}</span>
+                <span>{` · 输 ${agentUsage.totalPromptTokens}`}</span>
+                <span>{` · 出 ${agentUsage.totalCompletionTokens}`}</span>
+                {typeof agentUsage.totalReasoningTokens === "number" ? (
+                  <span>{` · 思 ${agentUsage.totalReasoningTokens}`}</span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
   }
 
   function renderMiddlePanel() {
@@ -1504,6 +1646,7 @@ export default function App() {
               {errorMessage}
             </div>
           )}
+          {renderConversationUsageSummary()}
         </header>
 
         {activeConversation && activeAgent ? (
@@ -1522,6 +1665,9 @@ export default function App() {
               imageCapabilityReason={imageCapability.reason}
               maxImageCount={groupImageLimits.maxImageCount}
               maxImageSizeMb={groupImageLimits.maxImageSizeMb}
+              showThinkingToggle={activeConversation.type === "direct"}
+              thinkingEnabled={isDirectThinkingEnabled}
+              onToggleThinking={handleToggleDirectThinking}
               onSend={handleSend}
             />
           </>

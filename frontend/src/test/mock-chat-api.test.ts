@@ -239,6 +239,7 @@ describe("chat api HTTP 适配层", () => {
             senderType: "user",
             senderId: "user",
             content: "请结合图片给建议",
+            render_format: "plain_text",
             createdAt: "2026-05-26T10:01:00.000Z",
             attachments: [
               {
@@ -260,11 +261,43 @@ describe("chat api HTTP 适配层", () => {
               senderType: "agent",
               senderId: "architect",
               content: "我先给一个结构化建议。",
+              render_format: "markdown",
+              thinking: {
+                available: true,
+                content: "先分析问题",
+                default_collapsed: true,
+              },
+              usage: {
+                prompt_tokens: 20,
+                completion_tokens: 30,
+                total_tokens: 50,
+              },
+              message_meta: {
+                provider: "openai",
+                model: "gpt-4o",
+                agent_id: "architect",
+                agent_name: "Architect",
+                round_index: 1,
+              },
               createdAt: "2026-05-26T10:01:01.000Z",
               attachments: [],
             },
           ],
           conversationUpdatedAt: "2026-05-26T10:01:01.000Z",
+          usage_summary: {
+            total_tokens: 50,
+            total_prompt_tokens: 20,
+            total_completion_tokens: 30,
+            by_agent: [
+              {
+                agent_id: "architect",
+                agent_name: "Architect",
+                total_tokens: 50,
+                total_prompt_tokens: 20,
+                total_completion_tokens: 30,
+              },
+            ],
+          },
         },
         201
       )
@@ -282,6 +315,11 @@ describe("chat api HTTP 适配层", () => {
           previewUrl: "https://example.com/wireframe.png",
         },
       ],
+      options: {
+        thinking: {
+          enabled: true,
+        },
+      },
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -303,6 +341,11 @@ describe("chat api HTTP 适配层", () => {
               metadata: {},
             },
           ],
+          options: {
+            thinking: {
+              enabled: true,
+            },
+          },
         }),
       })
     );
@@ -317,6 +360,98 @@ describe("chat api HTTP 适配层", () => {
       })
     );
     expect(response.agentMessages[0]?.attachments).toEqual([]);
+    expect(response.agentMessages[0]).toEqual(
+      expect.objectContaining({
+        renderFormat: "markdown",
+        thinking: {
+          available: true,
+          content: "先分析问题",
+          defaultCollapsed: true,
+        },
+        usage: {
+          promptTokens: 20,
+          completionTokens: 30,
+          totalTokens: 50,
+        },
+        messageMeta: {
+          provider: "openai",
+          model: "gpt-4o",
+          agentId: "architect",
+          agentName: "Architect",
+          roundIndex: 1,
+        },
+      })
+    );
+    expect(response.usageSummary).toEqual({
+      totalTokens: 50,
+      totalPromptTokens: 20,
+      totalCompletionTokens: 30,
+      totalReasoningTokens: undefined,
+      byAgent: [
+        {
+          agentId: "architect",
+          agentName: "Architect",
+          totalTokens: 50,
+          totalPromptTokens: 20,
+          totalCompletionTokens: 30,
+          totalReasoningTokens: undefined,
+        },
+      ],
+    });
+  });
+
+  it("发送消息时透传 warnings 并映射到前端响应结构", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          userMessage: {
+            id: "msg-user",
+            conversationId: "conv-1",
+            senderType: "user",
+            senderId: "user",
+            content: "请继续",
+            render_format: "plain_text",
+            createdAt: "2026-05-26T10:02:00.000Z",
+            attachments: [],
+          },
+          agentMessages: [],
+          conversationUpdatedAt: "2026-05-26T10:02:01.000Z",
+          usage_summary: {
+            total_tokens: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            by_agent: [],
+          },
+          warnings: [
+            {
+              code: "model_empty_reply",
+              message: "Architect 未返回可展示回复",
+            },
+          ],
+        },
+        201
+      )
+    );
+
+    const response = await sendMessage({
+      conversationId: "conv-1",
+      content: "请继续",
+    });
+
+    expect(response.agentMessages).toEqual([]);
+    expect(response.warnings).toEqual([
+      {
+        code: "model_empty_reply",
+        message: "Architect 未返回可展示回复",
+      },
+    ]);
+    expect(response.usageSummary).toEqual({
+      totalTokens: 0,
+      totalPromptTokens: 0,
+      totalCompletionTokens: 0,
+      totalReasoningTokens: undefined,
+      byAgent: [],
+    });
   });
 
   it("群聊 SSE 会消费分片事件流并映射成逐条事件", async () => {
@@ -367,6 +502,7 @@ describe("chat api HTTP 适配层", () => {
             content: "请开始",
           }),
           conversationUpdatedAt: null,
+          usageSummary: null,
           runtimeHooks: {
             dispatchStrategy: "broadcast_chain",
             triggerEventType: "user_message",
@@ -395,6 +531,7 @@ describe("chat api HTTP 适配层", () => {
             content: "先拆结构。",
           }),
           conversationUpdatedAt: "2026-05-26T10:01:01.000Z",
+          usageSummary: null,
           runtimeHooks: expect.objectContaining({
             dispatchStrategy: "broadcast_chain",
             triggerEventType: "user_message",
@@ -407,6 +544,7 @@ describe("chat api HTTP 适配层", () => {
         payload: {
           conversationId: "group-1",
           conversationUpdatedAt: "2026-05-26T10:01:01.000Z",
+          usageSummary: null,
           runtimeHooks: expect.objectContaining({
             dispatchStrategy: "broadcast_chain",
             reservedDispatchStrategies: ["broadcast_chain"],
@@ -442,6 +580,7 @@ describe("chat api HTTP 适配层", () => {
           message: undefined,
           conversationUpdatedAt: "2026-05-26T10:01:00.000Z",
           error: undefined,
+          usageSummary: null,
           runtimeHooks: {
             dispatchStrategy: "round_robin",
             triggerEventType: "dispatch_progress",
@@ -466,6 +605,64 @@ describe("chat api HTTP 适配层", () => {
               "manual_handoff",
             ],
           },
+        },
+      },
+    ]);
+  });
+
+  it("群聊 SSE 会保留 tool_call / tool_result 的完整工具字段", async () => {
+    fetchMock.mockResolvedValueOnce(
+      sseResponse([
+        'event: tool_call\ndata: {"event":"tool_call","payload":{"conversationId":"group-1","conversationUpdatedAt":"2026-05-26T10:01:00.000Z","agentId":"architect","agentName":"Architect","toolCallId":"tc_1","toolName":"web_search","toolArgs":{"query":"协议字段"},"runtimeHooks":{"dispatch_strategy":"broadcast_chain","trigger_event_type":"user_message","reserved_event_types":["user_message","moderator_note_ready","agent_message","conversation_updated","done","error"],"reserved_dispatch_strategies":["broadcast_chain"],"reserved_future_event_types":["agent_thinking","tool_call","tool_result","dispatch_progress"],"reserved_future_dispatch_strategies":["round_robin","parallel_fan_out","manual_handoff"]}}}\n\n',
+        'event: tool_result\ndata: {"event":"tool_result","payload":{"conversationId":"group-1","conversationUpdatedAt":"2026-05-26T10:01:01.000Z","agentId":"architect","agentName":"Architect","toolCallId":"tc_1","toolName":"web_search","resultPreview":"命中 2 条结果","runtimeHooks":{"dispatch_strategy":"broadcast_chain","trigger_event_type":"user_message","reserved_event_types":["user_message","moderator_note_ready","agent_message","conversation_updated","done","error"],"reserved_dispatch_strategies":["broadcast_chain"],"reserved_future_event_types":["agent_thinking","tool_call","tool_result","dispatch_progress"],"reserved_future_dispatch_strategies":["round_robin","parallel_fan_out","manual_handoff"]}}}\n\n',
+      ])
+    );
+
+    const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+
+    await sendGroupMessageStream(
+      {
+        conversationId: "group-1",
+        content: "请开始",
+      },
+      (event) => events.push(event as { event: string; payload: Record<string, unknown> })
+    );
+
+    expect(events).toEqual([
+      {
+        event: "tool_call",
+        payload: {
+          conversationId: "group-1",
+          message: undefined,
+          conversationUpdatedAt: "2026-05-26T10:01:00.000Z",
+          error: undefined,
+          usageSummary: null,
+          runtimeHooks: expect.objectContaining({
+            reservedFutureEventTypes: ["agent_thinking", "tool_call", "tool_result", "dispatch_progress"],
+          }),
+          agentId: "architect",
+          agentName: "Architect",
+          toolCallId: "tc_1",
+          toolName: "web_search",
+          toolArgs: { query: "协议字段" },
+        },
+      },
+      {
+        event: "tool_result",
+        payload: {
+          conversationId: "group-1",
+          message: undefined,
+          conversationUpdatedAt: "2026-05-26T10:01:01.000Z",
+          error: undefined,
+          usageSummary: null,
+          runtimeHooks: expect.objectContaining({
+            reservedFutureEventTypes: ["agent_thinking", "tool_call", "tool_result", "dispatch_progress"],
+          }),
+          agentId: "architect",
+          agentName: "Architect",
+          toolCallId: "tc_1",
+          toolName: "web_search",
+          resultPreview: "命中 2 条结果",
         },
       },
     ]);
@@ -625,7 +822,7 @@ describe("chat api HTTP 适配层", () => {
       provider: "openai",
       model: "gpt-4o",
       displayName: "OpenAI - GPT-4o",
-      apiFormat: "openai",
+      apiFormat: "openai_chat",
       baseUrl: "https://api.openai.com/v1",
       useFullUrl: false,
       apiKey: "demo-key",
@@ -643,7 +840,7 @@ describe("chat api HTTP 适配层", () => {
           provider: "openai",
           model: "gpt-4o",
           displayName: "OpenAI - GPT-4o",
-          apiFormat: "openai",
+          apiFormat: "openai_chat",
           baseUrl: "https://api.openai.com/v1",
           useFullUrl: false,
           apiKey: "demo-key",

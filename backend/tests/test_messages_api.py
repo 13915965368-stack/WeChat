@@ -2,6 +2,7 @@ import json
 import httpx
 from types import SimpleNamespace
 
+from app.llm.schemas import ChatResponse, ToolCall
 from app.routes import messages as messages_route
 from app.schemas import MessageStreamRuntimeHooks
 from app.llm.validator import LLMStreamInterruptedError
@@ -116,6 +117,91 @@ def test_post_message_in_direct_conversation_reflects_system_prompt_and_history_
     reply_content = response.json()["agentMessages"][0]["content"]
     assert "已参考系统提示词" in reply_content
     assert "已参考1条历史消息" in reply_content
+
+
+def test_post_message_in_direct_conversation_hides_thinking_when_disabled(client, monkeypatch):
+    monkeypatch.setattr(
+        chat_service,
+        "generate_agent_reply",
+        lambda *args, **kwargs: ChatResponse(
+            content="最终正文",
+            provider="qwen",
+            model="qwen-plus",
+            raw={"reasoning_content": "内部推理"},
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/messages",
+        json={
+            "conversationId": "direct-architect-default",
+            "content": "请回答",
+        },
+    )
+
+    assert response.status_code == 201
+    agent_message = response.json()["agentMessages"][0]
+    assert agent_message["content"] == "最终正文"
+    assert agent_message["thinking"] is None
+
+
+def test_post_message_in_direct_conversation_preserves_thinking_when_enabled(client, monkeypatch):
+    monkeypatch.setattr(
+        chat_service,
+        "generate_agent_reply",
+        lambda *args, **kwargs: ChatResponse(
+            content="最终正文",
+            provider="qwen",
+            model="qwen-plus",
+            raw={"reasoning_content": "内部推理"},
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/messages",
+        json={
+            "conversationId": "direct-architect-default",
+            "content": "请回答",
+            "options": {"thinking": {"enabled": True}},
+        },
+    )
+
+    assert response.status_code == 201
+    agent_message = response.json()["agentMessages"][0]
+    assert agent_message["content"] == "最终正文"
+    assert agent_message["thinking"] == {
+        "available": True,
+        "content": "内部推理",
+        "defaultCollapsed": True,
+    }
+
+
+def test_post_message_in_direct_conversation_rejects_empty_visible_reply_when_thinking_disabled(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        chat_service,
+        "generate_agent_reply",
+        lambda *args, **kwargs: ChatResponse(
+            content="<think>仅保留推理</think>",
+            provider="qwen",
+            model="qwen-plus",
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/messages",
+        json={
+            "conversationId": "direct-architect-default",
+            "content": "请回答",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "model_empty_reply",
+        "message": "Architect 未返回可展示回复",
+    }
 
 
 def test_post_message_persists_user_attachments_and_returns_them(client):
@@ -727,6 +813,11 @@ def test_post_message_in_group_conversation_injects_protocol_and_persists_modera
 
     moderator_request = captured_requests[0]
     assert moderator_request["metadata"]["purpose"] == "group_moderator_note"
+    assert any(
+        "Markdown 输出格式要求：" in content
+        for role, content in moderator_request["messages"]
+        if role == "system"
+    )
     assert "当前用户输入：请你们按顺序接力完成方案拆解" in moderator_request["messages"][-1][1]
     assert "成员数量：3" in moderator_request["messages"][-1][1]
     assert "1. Architect (architect)" in moderator_request["messages"][-1][1]
@@ -740,6 +831,7 @@ def test_post_message_in_group_conversation_injects_protocol_and_persists_modera
         system_messages = [content for role, content in public_request["messages"] if role == "system"]
         assert roles[-1] == "user"
         assert all(role == "system" for role in roles[:-1])
+        assert any("Markdown 输出格式要求：" in content for content in system_messages)
         assert any("固定顺序的群聊接力" in content for content in system_messages)
         assert any("群聊内部主持说明" in content for content in system_messages)
         assert public_request["metadata"]["group_protocol_version"] == "group_runtime_v1"
@@ -1056,12 +1148,55 @@ def test_post_message_stream_rejects_direct_conversation(client):
     )
 
     assert response.status_code == 409
-    assert response.json() == {
-        "error": {
-            "code": "conversation_not_streamable",
-            "message": "Streaming is only supported for group conversations",
-        }
-    }
+
+
+def test_post_message_stream_marks_group_member_empty_visible_reply_as_error(client, monkeypatch):
+    monkeypatch.setattr(chat_service, "_ensure_group_moderator_note", lambda *args, **kwargs: False)
+
+    def fake_generate_agent_reply(_db, _conversation, agent, _content, **kwargs):
+        if agent.id == "writer":
+            return ChatResponse(
+                content="<think>仅保留推理</think>",
+                provider="qwen",
+                model="qwen-plus",
+            )
+        return ChatResponse(
+            content=f"{agent.name} 正常回复",
+            provider="qwen",
+            model="qwen-plus",
+        )
+
+    monkeypatch.setattr(chat_service, "generate_agent_reply", fake_generate_agent_reply)
+
+    create_response = client.post(
+        "/api/v1/conversations/group",
+        json={
+            "title": "流式失败可见",
+            "memberIds": ["architect", "writer"],
+        },
+    )
+    assert create_response.status_code == 201
+    conversation_id = create_response.json()["id"]
+
+    response = client.post(
+        "/api/v1/messages/stream",
+        json={
+            "conversationId": conversation_id,
+            "content": "请按顺序回复",
+        },
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    assert [event["event"] for event in events] == [
+        "user_message",
+        "moderator_note_ready",
+        "agent_message",
+        "error",
+        "conversation_updated",
+        "done",
+    ]
+    assert events[3]["data"]["payload"]["error"]["message"] == "Writer 回复失败：Writer 未返回可展示回复"
 
 
 def test_post_message_stream_in_group_conversation_yields_ordered_events(client, monkeypatch):
@@ -1175,6 +1310,83 @@ def test_post_message_stream_in_group_conversation_yields_ordered_events(client,
         ]
         for request in captured_requests[1:]
     )
+
+
+def test_post_message_stream_in_group_conversation_includes_tool_event_fields(client, monkeypatch):
+    def fake_generate_group_moderator_note(
+        db,
+        conversation,
+        agent,
+        content,
+        member_summary,
+        history_messages=None,
+        event_window=None,
+    ):
+        return "先由 Architect 调工具检索，再继续接力。"
+
+    def fake_generate_agent_reply(
+        db,
+        conversation,
+        agent,
+        content,
+        thinking_enabled=False,
+        attachments=None,
+        history_messages=None,
+        member_summary=None,
+        replied_agent_ids=None,
+        event_window=None,
+        dispatch_state=None,
+        on_tool_call=None,
+        on_tool_result=None,
+    ):
+        if agent.id == "architect":
+            tc = ToolCall(id="tc_search_1", name="web_search", arguments={"query": "群聊工具事件契约"})
+            if on_tool_call:
+                on_tool_call(tc)
+            if on_tool_result:
+                on_tool_result(tc, "搜索结果摘要：找到 3 条相关资料。")
+        return f"{agent.id} reply"
+
+    monkeypatch.setattr(
+        chat_service,
+        "generate_group_moderator_note",
+        fake_generate_group_moderator_note,
+    )
+    monkeypatch.setattr(chat_service, "generate_agent_reply", fake_generate_agent_reply)
+
+    with client.stream(
+        "POST",
+        "/api/v1/messages/stream",
+        json={
+            "conversationId": "group-product-discussion-default",
+            "content": "请开始，并允许先调用工具。",
+        },
+    ) as response:
+        assert response.status_code == 200
+        events = _parse_sse_events(response.read().decode("utf-8"))
+
+    tool_call_event = next(event for event in events if event["event"] == "tool_call")
+    tool_result_event = next(event for event in events if event["event"] == "tool_result")
+
+    assert tool_call_event["data"]["payload"]["agentId"] == "architect"
+    assert tool_call_event["data"]["payload"]["agentName"] == "Architect"
+    assert tool_call_event["data"]["payload"]["toolCallId"] == "tc_search_1"
+    assert tool_call_event["data"]["payload"]["toolName"] == "web_search"
+    assert tool_call_event["data"]["payload"]["toolArgs"] == {"query": "群聊工具事件契约"}
+    assert tool_call_event["data"]["payload"]["resultPreview"] is None
+
+    assert tool_result_event["data"]["payload"]["agentId"] == "architect"
+    assert tool_result_event["data"]["payload"]["agentName"] == "Architect"
+    assert tool_result_event["data"]["payload"]["toolCallId"] == "tc_search_1"
+    assert tool_result_event["data"]["payload"]["toolName"] == "web_search"
+    assert tool_result_event["data"]["payload"]["toolArgs"] is None
+    assert tool_result_event["data"]["payload"]["resultPreview"] == "搜索结果摘要：找到 3 条相关资料。"
+    assert tool_result_event["data"]["payload"]["runtimeHooks"]["reservedFutureEventTypes"] == [
+        "agent_thinking",
+        "tool_call",
+        "tool_result",
+        "dispatch_progress",
+    ]
 
 
 def test_post_message_stream_uses_runtime_hooks_from_stream_payload(client, monkeypatch):

@@ -1,5 +1,9 @@
 import { useMemo } from "react";
 import type { Message, Agent } from "../types/chat";
+import { MessageMarkdown } from "./message/MessageMarkdown";
+import { ThinkingCollapse } from "./message/ThinkingCollapse";
+import { MessageUsageBadge } from "./message/MessageUsageBadge";
+import { sanitizeMessageContent } from "../utils/messageContent";
 
 type Props = {
   messages: Message[];
@@ -74,7 +78,9 @@ export function ChatMessageList({ messages, agents, activeAgentName, activeAgent
           const showAvatar =
             index === 0 || messages[index - 1].senderId !== message.senderId;
           const attachments = message.attachments ?? [];
-          const hasTextContent = message.content.trim().length > 0;
+          const displayContent = sanitizeMessageContent(message.content);
+          const hasTextContent = displayContent.length > 0;
+          const isMarkdownMessage = message.renderFormat === "markdown" && !isUser;
 
           return (
             <div
@@ -178,7 +184,7 @@ export function ChatMessageList({ messages, agents, activeAgentName, activeAgent
 
                   {hasTextContent ? (
                     <div
-                      className="relative rounded-2xl px-5 py-3.5 text-sm leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
+                      className="relative rounded-2xl px-5 py-3.5 text-sm leading-relaxed break-words [overflow-wrap:anywhere]"
                       style={
                         isUser
                           ? {
@@ -195,9 +201,18 @@ export function ChatMessageList({ messages, agents, activeAgentName, activeAgent
                             }
                       }
                     >
-                      {message.content}
+                      {isMarkdownMessage ? (
+                        <MessageMarkdown content={displayContent} />
+                      ) : (
+                        <div className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                          {displayContent}
+                        </div>
+                      )}
                     </div>
                   ) : null}
+
+                  {!isUser ? <ThinkingCollapse thinking={message.thinking} /> : null}
+                  {!isUser ? <MessageUsageBadge usage={message.usage} /> : null}
                 </div>
               </div>
             </div>

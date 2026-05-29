@@ -83,6 +83,54 @@ class ChatMessage:
 
 
 @dataclass(slots=True)
+class ThinkingConfig:
+    enabled: bool = False
+
+
+@dataclass(slots=True)
+class MessageThinking:
+    available: bool = False
+    content: str = ""
+    default_collapsed: bool = True
+
+
+@dataclass(slots=True)
+class MessageUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int | None = None
+    total_tokens: int = 0
+
+
+@dataclass(slots=True)
+class MessageMeta:
+    provider: str | None = None
+    model: str | None = None
+    agent_id: str | None = None
+    agent_name: str | None = None
+    round_index: int | None = None
+
+
+@dataclass(slots=True)
+class ConversationUsageByAgent:
+    agent_id: str
+    agent_name: str
+    total_tokens: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_reasoning_tokens: int | None = None
+
+
+@dataclass(slots=True)
+class ConversationUsageSummary:
+    total_tokens: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_reasoning_tokens: int | None = None
+    by_agent: list[ConversationUsageByAgent] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class ToolCallEvent:
     tool_call_id: str
     tool_name: str
@@ -167,6 +215,7 @@ class ChatRequest:
     attachments: list[AttachmentRef] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     tools: list[ToolDefinition] = field(default_factory=list)
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
 
 
 @dataclass(slots=True)
@@ -177,3 +226,5 @@ class ChatResponse:
     finish_reason: str = "stop"
     raw: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[ToolCall] = field(default_factory=list)
+    thinking: MessageThinking | None = None
+    usage: MessageUsage | None = None

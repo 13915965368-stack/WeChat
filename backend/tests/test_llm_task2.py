@@ -10,6 +10,7 @@ from app.llm.adapters.gemini import GeminiAdapter
 from app.llm.adapters.openai_compatible import OpenAICompatibleAdapter
 from app.llm.client_factory import create_client
 from app.llm.endpoint_fallback import EndpointFallbackError, resolve_endpoint_candidates, run_with_endpoint_fallback
+from app.llm.protocols.common import MARKDOWN_OUTPUT_GUIDE_MARKER
 from app.llm.schemas import (
     AdapterCapabilities,
     AdapterConfig,
@@ -18,6 +19,7 @@ from app.llm.schemas import (
     ChatRequest,
     ChatResponse,
 )
+from app.models import Agent, Conversation
 from app.llm.validator import (
     LLMStreamInterruptedError,
     LLMValidationError,
@@ -434,7 +436,10 @@ def test_openai_compatible_adapter_merges_multiple_system_messages_into_single_p
             },
             {"role": "user", "content": "请继续接力。"},
         ],
+        "thinking_budget": 0,
+        "reasoning_split": True,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
 
 
@@ -561,6 +566,346 @@ def test_openai_compatible_adapter_chat_still_requires_displayable_content(
         )
 
 
+def test_openai_compatible_adapter_validate_accepts_minimax_reasoning_details(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_post(url, *, json, headers, timeout):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_details": [{"text": "先分析上下文"}],
+                        },
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+            request=httpx.Request("POST", str(url)),
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="minimax",
+            model="MiniMax-M2.7",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://api.minimaxi.com/v1",
+        )
+    )
+
+    result = adapter.validate()
+
+    assert result.ok is True
+    assert result.status_message == "Model config validated successfully"
+
+
+def test_openai_compatible_adapter_posts_qwen_stream_usage_option(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    def fake_stream(method, url, *args, **kwargs):
+        captured["json"] = kwargs["json"]
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"你好"}}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="qwen",
+            model="qwen-plus",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="architect",
+            agent_name="Architect",
+            user_text="你好",
+        )
+    )
+
+    assert captured["json"]["stream_options"] == {"include_usage": True}
+    assert response.usage is not None
+    assert response.usage.total_tokens == 8
+
+
+def test_openai_compatible_adapter_stream_extracts_qwen_usage_from_usage_only_final_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"reasoning_content":"先想一下"}}]}',
+                    'data: {"choices":[{"delta":{"content":"最终答案"}}]}',
+                    'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":11,"total_tokens":18}}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="qwen",
+            model="qwen-plus",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="architect",
+            agent_name="Architect",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "最终答案"
+    assert response.raw["reasoning_content"] == "先想一下"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 18
+
+
+def test_openai_compatible_adapter_stream_extracts_kimi_choice_usage(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"你好"}}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop","usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}]}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="moonshot",
+            model="kimi-k2.6",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://api.moonshot.cn/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="writer",
+            agent_name="Writer",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "你好"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 10
+
+
+def test_openai_compatible_adapter_stream_extracts_usage_from_delta_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"你好"}}]}',
+                    'data: {"choices":[{"delta":{"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="moonshot",
+            model="kimi-k2.6",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://api.moonshot.cn/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="writer",
+            agent_name="Writer",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "你好"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 5
+
+
+def test_openai_compatible_adapter_stream_preserves_markdown_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"content":"导语"}}]}',
+                    'data: {"choices":[{"delta":{"content":"\\n\\n## 标题"}}]}',
+                    'data: {"choices":[{"delta":{"content":"\\n- 第一项"}}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="moonshot",
+            model="kimi-k2.6",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://api.moonshot.cn/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="writer",
+            agent_name="Writer",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "导语\n\n## 标题\n- 第一项"
+
+
+def test_openai_compatible_adapter_stream_extracts_minimax_usage_from_usage_only_final_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"reasoning_details":[{"text":"先规划"}]}}]}',
+                    'data: {"choices":[{"delta":{"content":"执行结果"}}]}',
+                    'data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":12,"total_tokens":20}}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="minimax",
+            model="MiniMax-M2.7",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://api.minimaxi.com/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="critic",
+            agent_name="Critic",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "执行结果"
+    assert response.raw["reasoning_content"] == "先规划"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 20
+
+
+def test_openai_compatible_adapter_stream_extracts_minimax_reasoning_details(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"choices":[{"delta":{"reasoning_details":[{"text":"先推理"}]}}]}',
+                    'data: {"choices":[{"delta":{"content":"最终答案"}}]}',
+                    'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":9,"total_tokens":14}}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = OpenAICompatibleAdapter(
+        AdapterConfig(
+            provider="minimax",
+            model="MiniMax-M2.7",
+            api_key="secret-key",
+            api_format="openai_chat",
+            base_url="https://api.minimaxi.com/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="writer",
+            agent_name="Writer",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "最终答案"
+    assert response.raw["reasoning_content"] == "先推理"
+    assert response.usage is not None
+    assert response.usage.total_tokens == 14
+
+
 def test_anthropic_adapter_posts_messages_payload(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, object] = {}
 
@@ -628,6 +973,51 @@ def test_anthropic_adapter_posts_messages_payload(monkeypatch: pytest.MonkeyPatc
     }
 
 
+def test_anthropic_adapter_stream_preserves_markdown_table_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"type":"message_start","message":{"id":"msg_123"}}',
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"表格如下"}}',
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\\n\\n| 列 | 值 |"}}',
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\\n| --- | --- |"}}',
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\\n| 类型 | Markdown |"}}',
+                    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+                    'data: {"type":"message_stop"}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = AnthropicAdapter(
+        AdapterConfig(
+            provider="anthropic",
+            model="claude-3-5-sonnet",
+            api_key="secret-key",
+            api_format="anthropic",
+            base_url="https://api.anthropic.com/v1",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="你好")],
+            agent_id="critic",
+            agent_name="Critic",
+            user_text="你好",
+        )
+    )
+
+    assert response.content == "表格如下\n\n| 列 | 值 |\n| --- | --- |\n| 类型 | Markdown |"
+
+
 def test_gemini_adapter_posts_generate_content_payload(monkeypatch: pytest.MonkeyPatch):
     captured: dict[str, object] = {}
 
@@ -687,6 +1077,89 @@ def test_gemini_adapter_posts_generate_content_payload(monkeypatch: pytest.Monke
         ],
         "systemInstruction": {"parts": [{"text": "你是一个助手。"}]},
     }
+
+
+def test_gemini_adapter_stream_preserves_code_fence_boundaries(monkeypatch: pytest.MonkeyPatch):
+    def fake_stream(method, url, *args, **kwargs):
+        return FakeStreamContext(
+            FakeStreamResponse(
+                url_text=str(url),
+                lines=[
+                    'data: {"candidates":[{"content":{"parts":[{"text":"```ts"},{"text":"\\nconst answer = 42;"},{"text":"\\n```"}]},"finishReason":"STOP"}]}',
+                    "data: [DONE]",
+                ],
+            )
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    adapter = GeminiAdapter(
+        AdapterConfig(
+            provider="gemini",
+            model="gemini-1.5-flash",
+            api_key="secret-key",
+            api_format="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+        )
+    )
+
+    response = adapter.chat(
+        ChatRequest(
+            config=adapter.config,
+            messages=[ChatMessage(role="user", content="继续")],
+            agent_id="writer",
+            agent_name="Writer",
+            user_text="继续",
+        )
+    )
+
+    assert response.content == "```ts\nconst answer = 42;\n```"
+
+
+def test_build_chat_request_includes_markdown_guide_for_empty_agent_system_prompt():
+    conversation = Conversation(
+        id="direct-architect-default",
+        type="direct",
+        title="Architect",
+        agent_id="architect",
+        source_conversation_id=None,
+        model_config_id=None,
+        runtime_metadata={},
+        is_disabled=False,
+        pinned=False,
+        pinned_at=None,
+        created_at="2026-05-29T00:00:00.000Z",
+        updated_at="2026-05-29T00:00:00.000Z",
+    )
+    agent = Agent(
+        id="architect",
+        name="Architect",
+        role_summary="擅长结构化拆解",
+        style_summary="偏框架化",
+        system_prompt="",
+        avatar="A",
+        avatar_image=None,
+        theme_color=None,
+        theme_light=None,
+        theme_soft=None,
+        model_config_id=None,
+        model_unavailable=False,
+        is_template=False,
+        pinned=False,
+        pinned_at=None,
+    )
+
+    request = chat_service_module.build_chat_request(
+        config=AdapterConfig(provider="qwen", model="qwen-plus"),
+        conversation=conversation,
+        agent=agent,
+        content="你好",
+        is_group=False,
+    )
+
+    assert request.messages[0].role == "system"
+    assert MARKDOWN_OUTPUT_GUIDE_MARKER in request.messages[0].content
+    assert request.messages[1] == ChatMessage(role="user", content="你好")
 
 
 def test_post_message_uses_factory_adapter(client, monkeypatch: pytest.MonkeyPatch):
@@ -880,6 +1353,8 @@ def test_post_message_passes_system_prompt_and_trimmed_history_to_adapter(client
     assert isinstance(request, ChatRequest)
     assert request.system_prompt == "你是一个偏系统性与结构化思考的智能助手。"
     assert request.messages[0].role == "system"
+    assert "Markdown 输出格式要求：" in request.messages[0].content
+    assert request.messages[0].content.startswith("你是一个偏系统性与结构化思考的智能助手。")
     assert request.messages[-1].role == "user"
     assert request.messages[-1].content == "请基于最近上下文继续"
 
@@ -968,6 +1443,7 @@ def test_post_group_message_uses_shared_history_for_each_agent_and_fixed_member_
     moderator_system_messages = [
         content for role, content in captured_requests[0]["messages"] if role == "system"
     ]
+    assert any("Markdown 输出格式要求：" in content for content in moderator_system_messages)
     assert any("固定顺序的群聊接力" in content for content in moderator_system_messages)
     assert any("一次性内部主持说明" in content for content in moderator_system_messages)
     assert "当前用户输入：请继续围绕第一版范围展开。" in captured_requests[0]["messages"][-1][1]
@@ -982,6 +1458,9 @@ def test_post_group_message_uses_shared_history_for_each_agent_and_fixed_member_
     architect_system_messages = [content for role, content in public_requests[0]["messages"] if role == "system"]
     critic_system_messages = [content for role, content in public_requests[1]["messages"] if role == "system"]
     writer_system_messages = [content for role, content in public_requests[2]["messages"] if role == "system"]
+    assert any("Markdown 输出格式要求：" in content for content in architect_system_messages)
+    assert any("Markdown 输出格式要求：" in content for content in critic_system_messages)
+    assert any("Markdown 输出格式要求：" in content for content in writer_system_messages)
     assert any("当前群聊运行段信息" in content for content in architect_system_messages)
     assert any("当前群聊运行段信息" in content for content in critic_system_messages)
     assert any("当前群聊运行段信息" in content for content in writer_system_messages)

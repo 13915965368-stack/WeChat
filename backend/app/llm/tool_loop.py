@@ -6,8 +6,30 @@ from typing import Callable
 
 from app.llm.schemas import ChatMessage, ChatRequest, ChatResponse, ToolCall, ToolRuntimeContext
 from app.llm.tools.registry import execute_tool
+from app.llm.usage import merge_usage
 
 MAX_TOOL_ROUNDS = 5
+
+
+def _coerce_loop_response(result) -> ChatResponse:
+    if isinstance(result, ChatResponse):
+        return result
+    raw = getattr(result, "raw", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    tool_calls = getattr(result, "tool_calls", [])
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    usage = getattr(result, "usage", None)
+    return ChatResponse(
+        content=str(getattr(result, "content", "") or ""),
+        provider=str(getattr(result, "provider", "") or ""),
+        model=str(getattr(result, "model", "") or ""),
+        finish_reason=str(getattr(result, "finish_reason", "stop") or "stop"),
+        raw=raw,
+        tool_calls=tool_calls,
+        usage=usage,
+    )
 
 
 def run_tool_loop(
@@ -22,12 +44,16 @@ def run_tool_loop(
         return client.chat(request)
 
     working_request = deepcopy(request)
+    accumulated_usage = None
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = client.chat(working_request)
+        response = _coerce_loop_response(client.chat(working_request))
+        accumulated_usage = merge_usage(accumulated_usage, response.usage)
 
         if not getattr(response, "tool_calls", None):
-            return response
+            if accumulated_usage is None:
+                return response
+            return replace(response, usage=accumulated_usage)
 
         working_request.messages.append(
             ChatMessage(
@@ -56,4 +82,8 @@ def run_tool_loop(
             )
 
     working_request.tools = []
-    return client.chat(working_request)
+    response = _coerce_loop_response(client.chat(working_request))
+    accumulated_usage = merge_usage(accumulated_usage, response.usage)
+    if accumulated_usage is None:
+        return response
+    return replace(response, usage=accumulated_usage)

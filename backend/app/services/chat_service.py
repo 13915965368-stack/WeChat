@@ -14,16 +14,42 @@ from app.common import utc_now_iso
 from app.config import get_settings
 from app.llm.client_factory import create_client
 from app.llm.endpoint_fallback import EndpointFallbackError, run_with_endpoint_fallback
+from app.llm.protocols.agents import (
+    build_group_moderator_note_instruction_message,
+    build_group_moderator_note_prompt as build_agent_group_moderator_note_prompt,
+    build_group_runtime_dispatch_system_message,
+    build_group_runtime_identity_system_message,
+    build_group_runtime_moderator_note_system_message,
+    build_group_runtime_protocol_system_message,
+)
+from app.llm.protocols.common import (
+    build_markdown_output_system_prompt,
+    resolve_render_format,
+    split_content_and_thinking,
+)
 from app.llm.schemas import (
     AdapterCapabilities,
     AdapterConfig,
     AttachmentRef,
     ChatMessage,
     ChatRequest,
+    ChatResponse,
+    ConversationUsageSummary,
+    MessageMeta,
+    MessageThinking,
+    MessageUsage,
+    ThinkingConfig,
     ToolRuntimeContext,
 )
 from app.llm.tool_loop import run_tool_loop
 from app.llm.tools.registry import get_tool_definitions
+from app.llm.usage import (
+    add_usage_to_summary,
+    clone_usage_summary,
+    normalize_usage_summary,
+    usage_summary_to_dict,
+    usage_to_dict,
+)
 from app.llm.validator import LLMValidationError
 from app.models import Agent, Conversation, LLMSettings, Message, ModelConfig
 from app.security import decrypt_secret
@@ -35,6 +61,7 @@ class MessageSendResult:
     user_message: Message
     agent_messages: list[Message]
     conversation_updated_at: str
+    conversation_usage_summary: dict[str, Any]
     warnings: list[dict[str, str]]
 
 
@@ -51,6 +78,7 @@ class GroupRuntimeState:
     attempted_agent_ids: list[str]
     emitted_agent_ids: list[str]
     failed_agent_ids: list[str]
+    conversation_usage_summary: ConversationUsageSummary
 
 
 MAX_HISTORY_MESSAGES = 12
@@ -84,20 +112,170 @@ GROUP_RUNTIME_RESERVED_FUTURE_DISPATCH_STRATEGIES = (
     "parallel_fan_out",
     "manual_handoff",
 )
-GROUP_RUNTIME_PROTOCOL_TEXT = (
-    "你正在参与一个固定顺序的群聊接力。你要承接当前讨论继续推进，而不是复述用户原话、"
-    "前序 Agent 原话或整段上下文记录。请结合自己的角色定位，只补充当前轮次最有价值的新增判断；"
-    "后续成员会继续接力，因此不要替别人一次性说完全部内容。内部主持说明只作为运行时协作约束，"
-    "不要在公开回复里直接暴露或自称正在主持。公开回复只需要写出你这轮真正要表达的内容；"
-    "发言者身份会由系统单独展示。若上下文中出现群聊记录，它们用于说明之前是谁说了什么，"
-    "不等于公开回复模板。如果用户要求你做自我介绍，可以自然介绍自己的身份和角色，"
-    "是否提到名字由你当前的人设和语境决定。"
-)
-GROUP_MODERATOR_NOTE_SYSTEM_TEXT = (
-    "你现在不是在生成公开回复，而是在为当前群聊生成一次性内部主持说明。"
-    "这段说明只写入群聊运行时元数据，不进入普通消息流。"
-)
 GROUP_REPLY_PREFIX_MAX_STRIPS = 3
+
+
+def _message_thinking_to_dict(thinking: MessageThinking | None) -> dict[str, Any]:
+    if thinking is None:
+        return {}
+    return {
+        "available": thinking.available,
+        "content": thinking.content,
+        "default_collapsed": thinking.default_collapsed,
+    }
+
+
+def _message_meta_to_dict(meta: MessageMeta | None) -> dict[str, Any]:
+    if meta is None:
+        return {}
+    payload: dict[str, Any] = {}
+    if meta.provider:
+        payload["provider"] = meta.provider
+    if meta.model:
+        payload["model"] = meta.model
+    if meta.agent_id:
+        payload["agent_id"] = meta.agent_id
+    if meta.agent_name:
+        payload["agent_name"] = meta.agent_name
+    if meta.round_index is not None:
+        payload["round_index"] = meta.round_index
+    return payload
+
+
+def _build_agent_system_message_content(agent: Agent) -> str:
+    return build_markdown_output_system_prompt(agent.system_prompt)
+
+
+def get_conversation_usage_summary(conversation: Conversation) -> ConversationUsageSummary:
+    runtime_metadata = deepcopy(conversation.runtime_metadata or {})
+    return normalize_usage_summary(runtime_metadata.get("usage_summary"))
+
+
+def _set_conversation_usage_summary(
+    conversation: Conversation,
+    summary: ConversationUsageSummary,
+) -> ConversationUsageSummary:
+    runtime_metadata = deepcopy(conversation.runtime_metadata or {})
+    runtime_metadata["usage_summary"] = usage_summary_to_dict(summary)
+    conversation.runtime_metadata = runtime_metadata
+    return summary
+
+
+def _build_message_meta(
+    response: ChatResponse,
+    *,
+    agent: Agent | None = None,
+    round_index: int | None = None,
+) -> MessageMeta:
+    return MessageMeta(
+        provider=response.provider or None,
+        model=response.model or None,
+        agent_id=agent.id if agent is not None else None,
+        agent_name=agent.name if agent is not None else None,
+        round_index=round_index,
+    )
+
+
+def _coerce_chat_response(result: ChatResponse | str) -> ChatResponse:
+    if isinstance(result, ChatResponse):
+        return result
+    if hasattr(result, "content"):
+        return ChatResponse(content=str(getattr(result, "content") or ""), provider="", model="")
+    return ChatResponse(content=str(result), provider="", model="")
+
+
+def _prepare_agent_response_display(
+    response: ChatResponse,
+    *,
+    allow_thinking_display: bool,
+) -> tuple[str, MessageThinking | None]:
+    render_content, thinking = split_content_and_thinking(
+        response.content,
+        reasoning_content=str((response.raw or {}).get("reasoning_content", "") or ""),
+    )
+    if not allow_thinking_display:
+        thinking = None
+    return render_content, thinking
+
+
+def _ensure_agent_response_displayable(
+    response: ChatResponse,
+    *,
+    allow_thinking_display: bool,
+    agent_name: str,
+) -> tuple[str, MessageThinking | None]:
+    render_content, thinking = _prepare_agent_response_display(
+        response,
+        allow_thinking_display=allow_thinking_display,
+    )
+    if render_content.strip():
+        return render_content, thinking
+    if response.tool_calls:
+        return render_content, thinking
+    if allow_thinking_display and thinking is not None and thinking.content.strip():
+        return render_content, thinking
+    raise LLMValidationError(
+        f"{agent_name} 未返回可展示回复",
+        code="model_empty_reply",
+        status_code=422,
+    )
+
+
+def _build_persisted_message(
+    *,
+    conversation_id: str,
+    sender_type: str,
+    sender_id: str,
+    content: str,
+    attachments: list[dict[str, Any]] | None = None,
+    response: ChatResponse | None = None,
+    created_at: str | None = None,
+    round_index: int | None = None,
+    agent: Agent | None = None,
+    allow_thinking_display: bool = True,
+) -> Message:
+    thinking = None
+    render_content = content.strip()
+    usage = None
+    message_meta = {}
+    if response is not None:
+        render_content, thinking = _prepare_agent_response_display(
+            response,
+            allow_thinking_display=allow_thinking_display,
+        )
+        usage = response.usage
+        message_meta = _message_meta_to_dict(
+            _build_message_meta(response, agent=agent, round_index=round_index)
+        )
+
+    return Message(
+        id=uuid4().hex,
+        conversation_id=conversation_id,
+        sender_type=sender_type,
+        sender_id=sender_id,
+        content=render_content,
+        render_format=resolve_render_format(sender_type=sender_type, content=render_content),
+        thinking_payload=_message_thinking_to_dict(thinking),
+        usage_payload=usage_to_dict(usage) or {},
+        message_meta=message_meta,
+        attachments=list(attachments or []),
+        created_at=created_at or utc_now_iso(),
+    )
+
+
+def _update_conversation_usage_from_response(
+    conversation: Conversation,
+    response: ChatResponse | None,
+    *,
+    agent: Agent,
+) -> ConversationUsageSummary:
+    summary = add_usage_to_summary(
+        get_conversation_usage_summary(conversation),
+        response.usage if response is not None else None,
+        agent_id=agent.id,
+        agent_name=agent.name,
+    )
+    return _set_conversation_usage_summary(conversation, summary)
 
 
 def _build_runtime_adapter_config(db: Session) -> AdapterConfig:
@@ -560,20 +738,15 @@ def _build_group_identity_system_message(
     replied_text = "、".join(replied_names) if replied_names else "当前轮次暂无其他成员已发言"
     upcoming_text = "、".join(upcoming_names) if upcoming_names else "你是本轮最后一位发言成员"
 
-    return ChatMessage(
-        role="system",
-        content=(
-            "当前公开回复身份说明：\n"
-            f"- 你的显示名：{agent.name} ({agent.id})\n"
-            f"- 你的角色定位：{agent.role_summary}\n"
-            f"- 你的当前顺位：第 {current_member['position']} 位，共 {len(member_summary)} 位成员\n"
-            f"- 当前群聊成员与顺序：\n{member_order_text}\n"
-            f"- 在你之前已完成当前轮次发言的成员：{replied_text}\n"
-            f"- 在你之后将继续接力的成员：{upcoming_text}\n"
-            "- 你不能只靠转录稿猜身份；以上顺序和身份信息就是当前群结构。\n"
-            "- 发言者身份会由显示层单独展示；公开回复只需要写出你这轮真正要表达的内容。\n"
-            "- 如果下方出现群聊上下文记录，其中的 speaker 字段是运行时元数据，不是公开回复模板。"
-        ),
+    return build_group_runtime_identity_system_message(
+        agent_name=agent.name,
+        agent_id=agent.id,
+        role_summary=agent.role_summary,
+        current_position=current_member["position"],
+        member_count=len(member_summary),
+        member_order_text=member_order_text,
+        replied_text=replied_text,
+        upcoming_text=upcoming_text,
     )
 
 
@@ -588,7 +761,7 @@ def _build_group_protocol_system_messages(
     if conversation.type != "group":
         return []
 
-    messages = [ChatMessage(role="system", content=GROUP_RUNTIME_PROTOCOL_TEXT)]
+    messages = [build_group_runtime_protocol_system_message()]
     identity_message = _build_group_identity_system_message(
         agent,
         member_summary or [],
@@ -602,28 +775,18 @@ def _build_group_protocol_system_messages(
             dispatch_state=dispatch_state,
         )
         messages.append(
-            ChatMessage(
-                role="system",
-                content=(
-                    "当前群聊运行段信息：\n"
-                    f"- 调度策略：{dispatch_state.get('strategy') or GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY}\n"
-                    f"- 运行状态：{dispatch_state.get('status') or 'running'}\n"
-                    f"- 触发事件类型：{(trigger_event or {}).get('event_type') or 'unknown'}\n"
-                    f"- 当前已完成成员：{', '.join(dispatch_state.get('completed_member_ids') or []) or '(空)'}\n"
-                    f"- 当前失败成员：{', '.join(dispatch_state.get('failed_member_ids') or []) or '(空)'}\n"
-                    f"- 当前待发言成员：{', '.join(dispatch_state.get('pending_member_ids') or []) or '(空)'}\n"
-                    "- 你需要承接当前公开事件窗口里最新的状态继续推进，不要把窗口里的记录当成公开回复模板。"
-                ),
+            build_group_runtime_dispatch_system_message(
+                strategy=dispatch_state.get("strategy") or GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY,
+                status=dispatch_state.get("status") or "running",
+                trigger_event_type=(trigger_event or {}).get("event_type") or "unknown",
+                completed_member_ids=list(dispatch_state.get("completed_member_ids") or []),
+                failed_member_ids=list(dispatch_state.get("failed_member_ids") or []),
+                pending_member_ids=list(dispatch_state.get("pending_member_ids") or []),
             )
         )
     moderator_note = _get_group_moderator_note(conversation)
     if moderator_note:
-        messages.append(
-            ChatMessage(
-                role="system",
-                content=f"群聊内部主持说明（仅内部使用，不要直接说出来）：{moderator_note}",
-            )
-        )
+        messages.append(build_group_runtime_moderator_note_system_message(moderator_note))
     return messages
 
 
@@ -648,19 +811,15 @@ def _build_group_moderator_note_prompt(
         ),
         1,
     )
-    return (
-        "请生成一段只供群聊内部使用的一次性主持说明。\n"
-        f"当前用户输入：{content.strip()}\n"
-        f"成员数量：{len(member_summary)}\n"
-        f"成员顺序：\n{_format_group_member_order(member_summary) or '(空)'}\n"
-        f"当前 Agent 身份：{agent.name} ({agent.id})，位于第 {agent_position} 位\n"
-        f"是否存在来源上下文：{'是' if conversation.source_conversation_id else '否'}\n"
-        f"当前上下文记录：\n{context_preview_text}\n\n"
-        "输出要求：\n"
-        "1. 用 2-5 句中文概括当前群聊要完成的事和协作方式。\n"
-        "2. 明确后续成员要按顺序承接，不要重复上下文记录。\n"
-        "3. 不要写成对用户可见的发言，不要自称主持人已经发言。\n"
-        "4. 不要输出 Markdown 标题或列表符号。"
+    return build_agent_group_moderator_note_prompt(
+        user_content=content,
+        member_count=len(member_summary),
+        member_order_text=_format_group_member_order(member_summary) or "(空)",
+        current_agent_name=agent.name,
+        current_agent_id=agent.id,
+        current_agent_position=agent_position,
+        has_source_context=bool(conversation.source_conversation_id),
+        context_preview_text=context_preview_text,
     )
 
 
@@ -873,6 +1032,7 @@ def build_chat_request(
     agent: Agent,
     content: str,
     is_group: bool,
+    thinking_enabled: bool = False,
     attachments: list[dict[str, Any]] | None = None,
     history_messages: list[ChatMessage] | None = None,
     member_summary: list[dict[str, Any]] | None = None,
@@ -881,8 +1041,9 @@ def build_chat_request(
     dispatch_state: dict[str, Any] | None = None,
 ) -> ChatRequest:
     messages: list[ChatMessage] = []
-    if agent.system_prompt.strip():
-        messages.append(ChatMessage(role="system", content=agent.system_prompt.strip()))
+    system_message_content = _build_agent_system_message_content(agent)
+    if system_message_content.strip():
+        messages.append(ChatMessage(role="system", content=system_message_content))
     if is_group:
         messages.extend(
             _build_group_protocol_system_messages(
@@ -913,6 +1074,7 @@ def build_chat_request(
         system_prompt=agent.system_prompt,
         is_group=is_group,
         attachments=attachment_refs,
+        thinking=ThinkingConfig(enabled=thinking_enabled),
         metadata=(
             {
                 "group_protocol_version": GROUP_RUNTIME_PROTOCOL_VERSION,
@@ -955,12 +1117,12 @@ def generate_group_moderator_note(
                 config=candidate_config,
                 messages=[
                     *(
-                        [ChatMessage(role="system", content=agent.system_prompt.strip())]
+                        [ChatMessage(role="system", content=_build_agent_system_message_content(agent))]
                         if agent.system_prompt.strip()
                         else []
                     ),
-                    ChatMessage(role="system", content=GROUP_RUNTIME_PROTOCOL_TEXT),
-                    ChatMessage(role="system", content=GROUP_MODERATOR_NOTE_SYSTEM_TEXT),
+                    build_group_runtime_protocol_system_message(),
+                    build_group_moderator_note_instruction_message(),
                     ChatMessage(role="user", content=moderator_prompt),
                 ],
                 agent_id=agent.id,
@@ -968,6 +1130,7 @@ def generate_group_moderator_note(
                 user_text=content,
                 system_prompt=agent.system_prompt,
                 is_group=True,
+                thinking=ThinkingConfig(enabled=False),
                 metadata={
                     "purpose": "group_moderator_note",
                     "group_protocol_version": GROUP_RUNTIME_PROTOCOL_VERSION,
@@ -992,6 +1155,7 @@ def _replace_chat_request_config(request: ChatRequest, config: AdapterConfig) ->
         attachments=request.attachments,
         metadata=request.metadata,
         tools=request.tools,
+        thinking=request.thinking,
     )
 
 
@@ -1011,6 +1175,7 @@ def generate_agent_reply(
     conversation: Conversation,
     agent: Agent,
     content: str,
+    thinking_enabled: bool = False,
     attachments: list[dict[str, Any]] | None = None,
     history_messages: list[ChatMessage] | None = None,
     member_summary: list[dict[str, Any]] | None = None,
@@ -1019,7 +1184,7 @@ def generate_agent_reply(
     dispatch_state: dict[str, Any] | None = None,
     on_tool_call: Any | None = None,
     on_tool_result: Any | None = None,
-) -> str:
+) -> ChatResponse | str:
     adapter_config = resolve_adapter_config(db, conversation, agent)
     tool_context = _build_tool_runtime_context(conversation, agent)
     chat_request = build_chat_request(
@@ -1028,6 +1193,7 @@ def generate_agent_reply(
         agent=agent,
         content=content,
         is_group=conversation.type == "group",
+        thinking_enabled=thinking_enabled,
         attachments=attachments,
         history_messages=history_messages,
         member_summary=member_summary,
@@ -1045,7 +1211,7 @@ def generate_agent_reply(
             tool_context=tool_context,
             on_tool_call=on_tool_call,
             on_tool_result=on_tool_result,
-        ).content,
+        ),
     )
 
 
@@ -1107,6 +1273,7 @@ def _initialize_group_runtime_state(
         attempted_agent_ids=[],
         emitted_agent_ids=[],
         failed_agent_ids=[],
+        conversation_usage_summary=get_conversation_usage_summary(conversation),
     )
 
 
@@ -1232,24 +1399,31 @@ def _run_group_agent_sequence(
             "dispatch_state": runtime_state.dispatch_state,
         }
         reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
-        reply_content = generate_agent_reply(
+        reply_response = _coerce_chat_response(generate_agent_reply(
             db,
             conversation,
             agent,
             content,
             **reply_kwargs,
-        )
-        reply_content = sanitize_group_reply_content(agent, reply_content)
-        reply_message = Message(
-            id=uuid4().hex,
+        ))
+        reply_response.content = sanitize_group_reply_content(agent, reply_response.content)
+        reply_message = _build_persisted_message(
             conversation_id=conversation.id,
             sender_type="agent",
             sender_id=agent.id,
-            content=reply_content,
+            content=reply_response.content,
             attachments=[],
+            response=reply_response,
             created_at=utc_now_iso(),
+            round_index=len(runtime_state.emitted_agent_ids) + 1,
+            agent=agent,
         )
         db.add(reply_message)
+        runtime_state.conversation_usage_summary = _update_conversation_usage_from_response(
+            conversation,
+            reply_response,
+            agent=agent,
+        )
         conversation.updated_at = reply_message.created_at
         _append_group_agent_reply(conversation, runtime_state, agent, reply_message)
         yield agent, reply_message
@@ -1303,6 +1477,7 @@ def send_message(
     conversation: Conversation,
     content: str,
     attachments: list[dict[str, Any]] | None = None,
+    thinking_enabled: bool = False,
 ) -> MessageSendResult:
     if "members" not in conversation.__dict__:
         db.refresh(conversation, ["members"])
@@ -1311,8 +1486,7 @@ def send_message(
     normalized_attachments = [dict(attachment) for attachment in attachments or []]
     history_records = load_recent_history_messages(db, conversation.id)
     history_messages = build_history_messages(db, conversation, history_records)
-    user_message = Message(
-        id=uuid4().hex,
+    user_message = _build_persisted_message(
         conversation_id=conversation.id,
         sender_type="user",
         sender_id="user",
@@ -1340,6 +1514,7 @@ def send_message(
         for reply_agent_id in runtime_state.reply_agent_ids:
             agent = runtime_state.agent_map[reply_agent_id]
             reply_kwargs: dict[str, Any] = {
+                "thinking_enabled": thinking_enabled,
                 "attachments": runtime_state.normalized_attachments,
                 "history_messages": runtime_state.history_messages,
                 "member_summary": runtime_state.member_summary,
@@ -1349,24 +1524,37 @@ def send_message(
             }
             reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
             try:
-                reply_content = generate_agent_reply(
+                reply_response = _coerce_chat_response(generate_agent_reply(
                     db,
                     conversation,
                     agent,
                     content,
                     **reply_kwargs,
+                ))
+                reply_response.content = sanitize_group_reply_content(agent, reply_response.content)
+                _ensure_agent_response_displayable(
+                    reply_response,
+                    allow_thinking_display=thinking_enabled,
+                    agent_name=agent.name,
                 )
-                reply_content = sanitize_group_reply_content(agent, reply_content)
-                reply_message = Message(
-                    id=uuid4().hex,
+                reply_message = _build_persisted_message(
                     conversation_id=conversation.id,
                     sender_type="agent",
                     sender_id=agent.id,
-                    content=reply_content,
+                    content=reply_response.content,
                     attachments=[],
+                    response=reply_response,
                     created_at=utc_now_iso(),
+                    round_index=len(runtime_state.emitted_agent_ids) + 1,
+                    agent=agent,
+                    allow_thinking_display=thinking_enabled,
                 )
                 db.add(reply_message)
+                runtime_state.conversation_usage_summary = _update_conversation_usage_from_response(
+                    conversation,
+                    reply_response,
+                    agent=agent,
+                )
                 conversation.updated_at = reply_message.created_at
                 _append_group_agent_reply(conversation, runtime_state, agent, reply_message)
                 agent_messages.append(reply_message)
@@ -1384,24 +1572,39 @@ def send_message(
         agent_messages = []
         for reply_agent_id in reply_agent_ids:
             agent = agent_map[reply_agent_id]
-            reply_content = generate_agent_reply(
+            reply_kwargs = _filter_callable_kwargs(
+                generate_agent_reply,
+                {
+                    "thinking_enabled": thinking_enabled,
+                    "attachments": normalized_attachments,
+                    "history_messages": history_messages,
+                },
+            )
+            reply_response = _coerce_chat_response(generate_agent_reply(
                 db,
                 conversation,
                 agent,
                 content,
-                attachments=normalized_attachments,
-                history_messages=history_messages,
+                **reply_kwargs,
+            ))
+            _ensure_agent_response_displayable(
+                reply_response,
+                allow_thinking_display=thinking_enabled,
+                agent_name=agent.name,
             )
-            reply_message = Message(
-                id=uuid4().hex,
+            reply_message = _build_persisted_message(
                 conversation_id=conversation.id,
                 sender_type="agent",
                 sender_id=agent.id,
-                content=reply_content,
+                content=reply_response.content,
                 attachments=[],
+                response=reply_response,
                 created_at=utc_now_iso(),
+                agent=agent,
+                allow_thinking_display=thinking_enabled,
             )
             db.add(reply_message)
+            _update_conversation_usage_from_response(conversation, reply_response, agent=agent)
             agent_messages.append(reply_message)
 
     conversation.updated_at = agent_messages[-1].created_at if agent_messages else base_time
@@ -1415,6 +1618,7 @@ def send_message(
         user_message=user_message,
         agent_messages=agent_messages,
         conversation_updated_at=conversation.updated_at,
+        conversation_usage_summary=usage_summary_to_dict(get_conversation_usage_summary(conversation)),
         warnings=warnings,
     )
 
@@ -1441,6 +1645,7 @@ def stream_group_message(
     conversation: Conversation,
     content: str,
     attachments: list[dict[str, Any]] | None = None,
+    thinking_enabled: bool = False,
 ) -> Generator[tuple[str, dict[str, Any]], None, None]:
     if conversation.type != "group":
         raise ValueError("message streaming is only supported for group conversations")
@@ -1453,8 +1658,7 @@ def stream_group_message(
     history_records = load_recent_history_messages(db, conversation.id)
     history_messages = build_history_messages(db, conversation, history_records)
 
-    user_message = Message(
-        id=uuid4().hex,
+    user_message = _build_persisted_message(
         conversation_id=conversation.id,
         sender_type="user",
         sender_id="user",
@@ -1481,6 +1685,7 @@ def stream_group_message(
             "conversation_id": conversation.id,
             "message": user_message,
             "conversation_updated_at": conversation.updated_at,
+            "conversation_usage_summary": usage_summary_to_dict(runtime_state.conversation_usage_summary),
             "runtime_hooks": _get_runtime_hooks_payload(
                 event_window=runtime_state.event_window,
                 dispatch_state=runtime_state.dispatch_state,
@@ -1498,6 +1703,9 @@ def stream_group_message(
                 {
                     "conversation_id": conversation.id,
                     "conversation_updated_at": conversation.updated_at,
+                    "conversation_usage_summary": usage_summary_to_dict(
+                        get_conversation_usage_summary(conversation)
+                    ),
                     "runtime_hooks": _get_runtime_hooks_payload(
                         event_window=runtime_state.event_window,
                         dispatch_state=runtime_state.dispatch_state,
@@ -1512,6 +1720,9 @@ def stream_group_message(
                 {
                     "conversation_id": conversation.id,
                     "conversation_updated_at": conversation.updated_at,
+                    "conversation_usage_summary": usage_summary_to_dict(
+                        get_conversation_usage_summary(conversation)
+                    ),
                     "error": _build_contextual_error_payload("群聊主持说明生成失败", exc),
                     "runtime_hooks": _get_runtime_hooks_payload(
                         event_window=runtime_state.event_window,
@@ -1522,6 +1733,7 @@ def stream_group_message(
     for reply_agent_id in runtime_state.reply_agent_ids:
         agent = runtime_state.agent_map[reply_agent_id]
         reply_kwargs: dict[str, Any] = {
+            "thinking_enabled": thinking_enabled,
             "attachments": runtime_state.normalized_attachments,
             "history_messages": runtime_state.history_messages,
             "member_summary": runtime_state.member_summary,
@@ -1546,6 +1758,7 @@ def stream_group_message(
             tool_events_buffer.append(("tool_result", {
                 "conversation_id": conversation.id,
                 "agent_id": agent.id,
+                "agent_name": agent.name,
                 "tool_call_id": tc.id,
                 "tool_name": tc.name,
                 "result_preview": result[:500],
@@ -1556,24 +1769,37 @@ def stream_group_message(
         reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
 
         try:
-            reply_content = generate_agent_reply(
+            reply_response = _coerce_chat_response(generate_agent_reply(
                 db,
                 conversation,
                 agent,
                 content,
                 **reply_kwargs,
+            ))
+            reply_response.content = sanitize_group_reply_content(agent, reply_response.content)
+            _ensure_agent_response_displayable(
+                reply_response,
+                allow_thinking_display=thinking_enabled,
+                agent_name=agent.name,
             )
-            reply_content = sanitize_group_reply_content(agent, reply_content)
-            reply_message = Message(
-                id=uuid4().hex,
+            reply_message = _build_persisted_message(
                 conversation_id=conversation.id,
                 sender_type="agent",
                 sender_id=agent.id,
-                content=reply_content,
+                content=reply_response.content,
                 attachments=[],
+                response=reply_response,
                 created_at=utc_now_iso(),
+                round_index=len(runtime_state.emitted_agent_ids) + 1,
+                agent=agent,
+                allow_thinking_display=thinking_enabled,
             )
             db.add(reply_message)
+            runtime_state.conversation_usage_summary = _update_conversation_usage_from_response(
+                conversation,
+                reply_response,
+                agent=agent,
+            )
             conversation.updated_at = reply_message.created_at
             _append_group_agent_reply(conversation, runtime_state, agent, reply_message)
         except Exception as exc:
@@ -1590,6 +1816,9 @@ def stream_group_message(
                     {
                         "conversation_id": conversation.id,
                         "conversation_updated_at": conversation.updated_at,
+                        "conversation_usage_summary": usage_summary_to_dict(
+                            get_conversation_usage_summary(conversation)
+                        ),
                         "error": _build_stream_error_payload(persistence_exc),
                         "runtime_hooks": _get_runtime_hooks_payload(
                             event_window=runtime_state.event_window,
@@ -1603,6 +1832,9 @@ def stream_group_message(
                 {
                     "conversation_id": conversation.id,
                     "conversation_updated_at": conversation.updated_at,
+                    "conversation_usage_summary": usage_summary_to_dict(
+                        get_conversation_usage_summary(conversation)
+                    ),
                     "error": _build_contextual_error_payload(
                         f"{agent.name} 回复失败",
                         exc,
@@ -1624,6 +1856,9 @@ def stream_group_message(
                     {
                         **event_payload,
                         "conversation_updated_at": conversation.updated_at,
+                        "conversation_usage_summary": usage_summary_to_dict(
+                            runtime_state.conversation_usage_summary
+                        ),
                         "runtime_hooks": _get_runtime_hooks_payload(
                             event_window=runtime_state.event_window,
                             dispatch_state=runtime_state.dispatch_state,
@@ -1637,6 +1872,9 @@ def stream_group_message(
                     "conversation_id": conversation.id,
                     "message": reply_message,
                     "conversation_updated_at": conversation.updated_at,
+                    "conversation_usage_summary": usage_summary_to_dict(
+                        runtime_state.conversation_usage_summary
+                    ),
                     "runtime_hooks": _get_runtime_hooks_payload(
                         event_window=runtime_state.event_window,
                         dispatch_state=runtime_state.dispatch_state,
@@ -1650,6 +1888,9 @@ def stream_group_message(
                 {
                     "conversation_id": conversation.id,
                     "conversation_updated_at": conversation.updated_at,
+                    "conversation_usage_summary": usage_summary_to_dict(
+                        runtime_state.conversation_usage_summary
+                    ),
                     "error": _build_stream_error_payload(exc),
                     "runtime_hooks": _get_runtime_hooks_payload(
                         event_window=runtime_state.event_window,
@@ -1664,6 +1905,7 @@ def stream_group_message(
         {
             "conversation_id": conversation.id,
             "conversation_updated_at": conversation.updated_at,
+            "conversation_usage_summary": usage_summary_to_dict(runtime_state.conversation_usage_summary),
             "runtime_hooks": _get_runtime_hooks_payload(
                 event_window=runtime_state.event_window,
                 dispatch_state=runtime_state.dispatch_state,
@@ -1675,6 +1917,7 @@ def stream_group_message(
         {
             "conversation_id": conversation.id,
             "conversation_updated_at": conversation.updated_at,
+            "conversation_usage_summary": usage_summary_to_dict(runtime_state.conversation_usage_summary),
             "runtime_hooks": _get_runtime_hooks_payload(
                 event_window=runtime_state.event_window,
                 dispatch_state=runtime_state.dispatch_state,
