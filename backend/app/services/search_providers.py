@@ -5,8 +5,7 @@ import time
 
 import httpx
 
-from app.llm.schemas import SearchRuntimeConfigSnapshot
-from app.services.search_types import SearchAttempt, SearchItem, SearchResponse
+from app.services.search_types import SearchAttempt, SearchItem, SearchResponse, SearchRuntimeConfigSnapshot
 
 
 class BaseSearchProvider(ABC):

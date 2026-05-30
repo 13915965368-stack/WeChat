@@ -5,7 +5,7 @@ from dataclasses import replace
 from typing import Callable
 
 from app.llm.schemas import ChatMessage, ChatRequest, ChatResponse, ToolCall, ToolRuntimeContext
-from app.llm.tools.registry import execute_tool
+from app.llm.tools.registry import execute_tool_full
 from app.llm.usage import merge_usage
 
 MAX_TOOL_ROUNDS = 5
@@ -68,15 +68,15 @@ def run_tool_loop(
             if on_tool_call:
                 on_tool_call(tc)
 
-            result = execute_tool(tc.name, tc.arguments, context=tool_context)
+            result = execute_tool_full(tc.name, tc.arguments, context=tool_context)
 
             if on_tool_result:
-                on_tool_result(tc, result)
+                on_tool_result(tc, result.text)
 
             working_request.messages.append(
                 ChatMessage(
                     role="tool",
-                    content=result,
+                    content=result.text,
                     tool_call_id=tc.id,
                 )
             )

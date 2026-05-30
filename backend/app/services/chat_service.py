@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from dataclasses import dataclass
 from inspect import Parameter, signature
-import re
 from typing import Any, Generator
 from uuid import uuid4
 
+import app.services.prompt_builder as prompt_builder_module
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -14,16 +15,7 @@ from app.common import utc_now_iso
 from app.config import get_settings
 from app.llm.client_factory import create_client
 from app.llm.endpoint_fallback import EndpointFallbackError, run_with_endpoint_fallback
-from app.llm.protocols.agents import (
-    build_group_moderator_note_instruction_message,
-    build_group_moderator_note_prompt as build_agent_group_moderator_note_prompt,
-    build_group_runtime_dispatch_system_message,
-    build_group_runtime_identity_system_message,
-    build_group_runtime_moderator_note_system_message,
-    build_group_runtime_protocol_system_message,
-)
 from app.llm.protocols.common import (
-    build_markdown_output_system_prompt,
     resolve_render_format,
     split_content_and_thinking,
 )
@@ -43,6 +35,8 @@ from app.llm.schemas import (
 )
 from app.llm.tool_loop import run_tool_loop
 from app.llm.tools.registry import get_tool_definitions
+from app.llm.tools.capabilities import SearchCapability, ToolCapabilities
+from app.llm.tools.tool_services import ToolServices
 from app.llm.usage import (
     add_usage_to_summary,
     clone_usage_summary,
@@ -53,7 +47,47 @@ from app.llm.usage import (
 from app.llm.validator import LLMValidationError
 from app.models import Agent, Conversation, LLMSettings, Message, ModelConfig
 from app.security import decrypt_secret
+from app.services.adapter_config_factory import build_adapter_config_from_model
+from app.services.group_runtime_state import (
+    GROUP_RUNTIME_DEFAULT_EVENT_VISIBILITY,
+    GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY,
+    GROUP_RUNTIME_PROTOCOL_VERSION,
+    GROUP_RUNTIME_RESERVED_DISPATCH_STRATEGIES,
+    GROUP_RUNTIME_RESERVED_EVENT_TYPES,
+    GROUP_RUNTIME_RESERVED_FUTURE_DISPATCH_STRATEGIES,
+    GROUP_RUNTIME_RESERVED_FUTURE_EVENT_TYPES,
+    GROUP_RUNTIME_THREAD_ID,
+    GROUP_RUNTIME_USER_SPEAKER_NAME,
+    GroupRuntimeState,
+    _append_group_agent_reply,
+    _append_group_public_event,
+    _build_group_dispatch_state,
+    _build_group_public_event,
+    _build_group_reply_agent_ids,
+    _build_group_trigger_event,
+    _get_group_moderator_note,
+    _is_group_runtime_trigger_event,
+    _is_group_runtime_user_sender,
+    _mark_group_agent_failure,
+    _resolve_group_trigger_event,
+    _serialize_group_event_window,
+    _sync_group_dispatch_state,
+    _update_group_default_thread_runtime,
+    build_group_runtime_hooks,
+    build_group_runtime_metadata,
+    ensure_group_runtime_metadata,
+)
+from app.services.group_text_sanitizer import (
+    GROUP_REPLY_PREFIX_MAX_STRIPS,
+    sanitize_group_reply_content,
+    strip_speaker_prefix_once,
+)
+from app.services.group_turn_runner import run_single_group_agent_turn
 from app.services.search_service import build_search_runtime_config
+from app.services.stream_errors import (
+    build_contextual_error_payload as _build_contextual_error_payload,
+    build_stream_error_payload as _build_stream_error_payload,
+)
 
 
 @dataclass
@@ -65,56 +99,8 @@ class MessageSendResult:
     warnings: list[dict[str, str]]
 
 
-@dataclass
-class GroupRuntimeState:
-    history_messages: list[ChatMessage]
-    normalized_attachments: list[dict[str, Any]]
-    reply_agent_ids: list[str]
-    agent_map: dict[str, Agent]
-    member_summary: list[dict[str, Any]]
-    member_lookup: dict[str, dict[str, Any]]
-    event_window: list[dict[str, Any]]
-    dispatch_state: dict[str, Any]
-    attempted_agent_ids: list[str]
-    emitted_agent_ids: list[str]
-    failed_agent_ids: list[str]
-    conversation_usage_summary: ConversationUsageSummary
-
-
 MAX_HISTORY_MESSAGES = 12
 MAX_GROUP_ROUND_MESSAGES = 64
-GROUP_RUNTIME_PROTOCOL_VERSION = "group_runtime_v1"
-GROUP_RUNTIME_THREAD_ID = "default"
-GROUP_RUNTIME_EVENT_WINDOW_VERSION = "group_event_window_v1"
-GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY = "broadcast_chain"
-GROUP_RUNTIME_DEFAULT_EVENT_VISIBILITY = "public"
-GROUP_RUNTIME_USER_MEMBER_ID = "user"
-GROUP_RUNTIME_USER_SENDER_TYPE = "user"
-GROUP_RUNTIME_USER_SPEAKER_NAME = "用户"
-GROUP_RUNTIME_TRIGGER_EVENT_TYPE = "user_message"
-GROUP_RUNTIME_RESERVED_EVENT_TYPES = (
-    GROUP_RUNTIME_TRIGGER_EVENT_TYPE,
-    "moderator_note_ready",
-    "agent_message",
-    "conversation_updated",
-    "done",
-    "error",
-)
-GROUP_RUNTIME_RESERVED_FUTURE_EVENT_TYPES = (
-    "agent_thinking",
-    "tool_call",
-    "tool_result",
-    "dispatch_progress",
-)
-GROUP_RUNTIME_RESERVED_DISPATCH_STRATEGIES = (GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY,)
-GROUP_RUNTIME_RESERVED_FUTURE_DISPATCH_STRATEGIES = (
-    "round_robin",
-    "parallel_fan_out",
-    "manual_handoff",
-)
-GROUP_REPLY_PREFIX_MAX_STRIPS = 3
-
-
 def _message_thinking_to_dict(thinking: MessageThinking | None) -> dict[str, Any]:
     if thinking is None:
         return {}
@@ -143,7 +129,7 @@ def _message_meta_to_dict(meta: MessageMeta | None) -> dict[str, Any]:
 
 
 def _build_agent_system_message_content(agent: Agent) -> str:
-    return build_markdown_output_system_prompt(agent.system_prompt)
+    return prompt_builder_module._agent_system_content(agent)
 
 
 def get_conversation_usage_summary(conversation: Conversation) -> ConversationUsageSummary:
@@ -301,288 +287,7 @@ def _build_runtime_adapter_config(db: Session) -> AdapterConfig:
 
 
 def _build_model_adapter_config(model_config: ModelConfig) -> AdapterConfig:
-    settings = get_settings()
-    return AdapterConfig(
-        provider=model_config.provider,
-        model=model_config.model,
-        api_key=decrypt_secret(model_config.api_key_encrypted, settings),
-        api_format=model_config.api_format,
-        base_url=model_config.base_url,
-        use_full_url=model_config.use_full_url,
-        capabilities=AdapterCapabilities.from_mapping(model_config.capabilities),
-        metadata={
-            "model_config_id": model_config.id,
-            "source": "model_config",
-            "status": model_config.status,
-        },
-    )
-
-
-def build_group_runtime_metadata(conversation: Conversation) -> dict[str, Any]:
-    metadata = deepcopy(conversation.runtime_metadata or {})
-    if conversation.type != "group":
-        return metadata
-
-    group_runtime = deepcopy(metadata.get("group_runtime") or {})
-    protocol = deepcopy(group_runtime.get("protocol") or {})
-    default_thread = deepcopy(group_runtime.get("default_thread") or {})
-    moderator_note = deepcopy(default_thread.get("moderator_note") or {})
-    event_window = deepcopy(default_thread.get("event_window") or {})
-    dispatch_state = deepcopy(default_thread.get("dispatch_state") or {})
-
-    protocol.update(
-        {
-            "version": GROUP_RUNTIME_PROTOCOL_VERSION,
-            "mode": "fixed_group_chat",
-            "thread_id": GROUP_RUNTIME_THREAD_ID,
-            "scope": "conversation_default_thread",
-        }
-    )
-    moderator_note.setdefault("status", "pending")
-    moderator_note.setdefault("content", None)
-    moderator_note.setdefault("generated_by_agent_id", None)
-    moderator_note.setdefault("generated_at", None)
-    moderator_note.setdefault("input", None)
-    event_window.setdefault("version", GROUP_RUNTIME_EVENT_WINDOW_VERSION)
-    event_window.setdefault("events", [])
-    event_window.setdefault("last_event_id", None)
-    event_window.setdefault("last_event_type", None)
-    dispatch_state.setdefault("status", "idle")
-    dispatch_state.setdefault("strategy", GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY)
-    dispatch_state.setdefault("trigger_event_id", None)
-    dispatch_state.setdefault("cursor", 0)
-    dispatch_state.setdefault("pending_member_ids", [])
-    dispatch_state.setdefault("completed_member_ids", [])
-    dispatch_state.setdefault("failed_member_ids", [])
-    dispatch_state.setdefault("last_completed_event_id", None)
-    default_thread.update(
-        {
-            "thread_id": GROUP_RUNTIME_THREAD_ID,
-            "kind": "conversation_default_thread",
-            "moderator_note": moderator_note,
-            "event_window": event_window,
-            "dispatch_state": dispatch_state,
-        }
-    )
-    group_runtime.update(
-        {
-            "protocol": protocol,
-            "default_thread": default_thread,
-        }
-    )
-    metadata["group_runtime"] = group_runtime
-    return metadata
-
-
-def ensure_group_runtime_metadata(conversation: Conversation) -> dict[str, Any]:
-    metadata = build_group_runtime_metadata(conversation)
-    if metadata != (conversation.runtime_metadata or {}):
-        conversation.runtime_metadata = metadata
-    return metadata
-
-
-def _get_group_runtime_metadata(conversation: Conversation) -> dict[str, Any]:
-    if conversation.type != "group":
-        return {}
-    return ensure_group_runtime_metadata(conversation)
-
-
-def _get_group_moderator_note(conversation: Conversation) -> str | None:
-    runtime_metadata = _get_group_runtime_metadata(conversation)
-    content = (
-        runtime_metadata.get("group_runtime", {})
-        .get("default_thread", {})
-        .get("moderator_note", {})
-        .get("content")
-    )
-    if not isinstance(content, str):
-        return None
-    normalized_content = content.strip()
-    return normalized_content or None
-
-
-def _update_group_default_thread_runtime(
-    conversation: Conversation,
-    *,
-    moderator_note: dict[str, Any] | None = None,
-    event_window: dict[str, Any] | None = None,
-    dispatch_state: dict[str, Any] | None = None,
-) -> None:
-    runtime_metadata = _get_group_runtime_metadata(conversation)
-    group_runtime = deepcopy(runtime_metadata.get("group_runtime") or {})
-    default_thread = deepcopy(group_runtime.get("default_thread") or {})
-    if moderator_note is not None:
-        default_thread["moderator_note"] = moderator_note
-    if event_window is not None:
-        default_thread["event_window"] = event_window
-    if dispatch_state is not None:
-        default_thread["dispatch_state"] = dispatch_state
-    group_runtime["default_thread"] = default_thread
-    updated_metadata = deepcopy(runtime_metadata)
-    updated_metadata["group_runtime"] = group_runtime
-    conversation.runtime_metadata = updated_metadata
-
-
-def _is_group_runtime_user_member_id(member_id: str) -> bool:
-    return member_id.strip() == GROUP_RUNTIME_USER_MEMBER_ID
-
-
-def _is_group_runtime_user_sender(sender_type: str, sender_id: str) -> bool:
-    return sender_type == GROUP_RUNTIME_USER_SENDER_TYPE and _is_group_runtime_user_member_id(sender_id)
-
-
-def _build_group_reply_agent_ids(sorted_members: list[Any]) -> list[str]:
-    return [
-        member.member_id
-        for member in sorted_members
-        if not _is_group_runtime_user_member_id(member.member_id)
-    ]
-
-
-def _build_group_public_event(
-    *,
-    event_type: str,
-    sender_type: str,
-    sender_id: str,
-    content: str,
-    speaker_name: str,
-    member_lookup: dict[str, dict[str, Any]] | None = None,
-    event_id: str | None = None,
-    created_at: str | None = None,
-) -> dict[str, Any]:
-    member = (member_lookup or {}).get(sender_id)
-    return {
-        "event_id": event_id or uuid4().hex,
-        "event_type": event_type,
-        "visibility": GROUP_RUNTIME_DEFAULT_EVENT_VISIBILITY,
-        "sender_type": sender_type,
-        "sender_id": sender_id,
-        "speaker_name": speaker_name,
-        "speaker_role": member.get("role_summary") if member else None,
-        "position": member.get("position") if member else None,
-        "content": content.strip(),
-        "created_at": created_at,
-    }
-
-
-def _build_group_trigger_event(
-    *,
-    content: str,
-    member_lookup: dict[str, dict[str, Any]] | None = None,
-    event_id: str | None = None,
-    created_at: str | None = None,
-) -> dict[str, Any]:
-    return _build_group_public_event(
-        event_type=GROUP_RUNTIME_TRIGGER_EVENT_TYPE,
-        sender_type=GROUP_RUNTIME_USER_SENDER_TYPE,
-        sender_id=GROUP_RUNTIME_USER_MEMBER_ID,
-        content=content,
-        speaker_name=GROUP_RUNTIME_USER_SPEAKER_NAME,
-        member_lookup=member_lookup,
-        event_id=event_id,
-        created_at=created_at,
-    )
-
-
-def _append_group_public_event(
-    event_window: list[dict[str, Any]],
-    event: dict[str, Any],
-) -> list[dict[str, Any]]:
-    updated_window = [*event_window, deepcopy(event)]
-    if len(updated_window) > MAX_GROUP_ROUND_MESSAGES:
-        updated_window = updated_window[-MAX_GROUP_ROUND_MESSAGES:]
-    return updated_window
-
-
-def _serialize_group_event_window(event_window: list[dict[str, Any]]) -> dict[str, Any]:
-    last_event = event_window[-1] if event_window else {}
-    return {
-        "version": GROUP_RUNTIME_EVENT_WINDOW_VERSION,
-        "events": deepcopy(event_window),
-        "last_event_id": last_event.get("event_id"),
-        "last_event_type": last_event.get("event_type"),
-    }
-
-
-def _is_group_runtime_trigger_event(event: dict[str, Any] | None) -> bool:
-    if event is None:
-        return False
-    return event.get("event_type") == GROUP_RUNTIME_TRIGGER_EVENT_TYPE and _is_group_runtime_user_sender(
-        str(event.get("sender_type") or ""),
-        str(event.get("sender_id") or ""),
-    )
-
-
-def _resolve_group_trigger_event(
-    event_window: list[dict[str, Any]] | None = None,
-    dispatch_state: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    trigger_event_id = (dispatch_state or {}).get("trigger_event_id")
-    if trigger_event_id:
-        matched_event = next(
-            (
-                event
-                for event in event_window or []
-                if event.get("event_id") == trigger_event_id
-            ),
-            None,
-        )
-        if matched_event is not None:
-            return matched_event
-    return next((event for event in event_window or [] if _is_group_runtime_trigger_event(event)), None)
-
-
-def build_group_runtime_hooks(
-    *,
-    event_window: list[dict[str, Any]] | None = None,
-    dispatch_state: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    trigger_event = _resolve_group_trigger_event(
-        event_window=event_window,
-        dispatch_state=dispatch_state,
-    )
-    return {
-        "dispatch_strategy": (dispatch_state or {}).get(
-            "strategy",
-            GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY,
-        ),
-        "trigger_event_type": (trigger_event or {}).get(
-            "event_type",
-            GROUP_RUNTIME_TRIGGER_EVENT_TYPE,
-        ),
-        "reserved_event_types": list(GROUP_RUNTIME_RESERVED_EVENT_TYPES),
-        "reserved_dispatch_strategies": list(GROUP_RUNTIME_RESERVED_DISPATCH_STRATEGIES),
-        "reserved_future_event_types": list(GROUP_RUNTIME_RESERVED_FUTURE_EVENT_TYPES),
-        "reserved_future_dispatch_strategies": list(
-            GROUP_RUNTIME_RESERVED_FUTURE_DISPATCH_STRATEGIES
-        ),
-    }
-
-
-def _build_group_dispatch_state(
-    *,
-    trigger_event_id: str | None,
-    reply_agent_ids: list[str],
-    completed_member_ids: list[str] | None = None,
-    failed_member_ids: list[str] | None = None,
-    status: str = "running",
-    strategy: str = GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY,
-    last_completed_event_id: str | None = None,
-) -> dict[str, Any]:
-    completed = list(completed_member_ids or [])
-    failed = list(failed_member_ids or [])
-    processed = [*completed, *(agent_id for agent_id in failed if agent_id not in completed)]
-    pending = [agent_id for agent_id in reply_agent_ids if agent_id not in processed]
-    return {
-        "status": status,
-        "strategy": strategy,
-        "trigger_event_id": trigger_event_id,
-        "cursor": len(processed),
-        "pending_member_ids": pending,
-        "completed_member_ids": completed,
-        "failed_member_ids": failed,
-        "last_completed_event_id": last_completed_event_id,
-    }
+    return build_adapter_config_from_model(model_config, source="model_config")
 
 
 def _build_group_context_record(
@@ -598,61 +303,28 @@ def _build_group_context_record(
     position: int | None = None,
     member_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    lines = [
-        "[record]",
-        f"event_id={event_id or ''}",
-        f"event_type={event_type or ''}",
-        f"visibility={visibility or GROUP_RUNTIME_DEFAULT_EVENT_VISIBILITY}",
-        f"speaker_type={sender_type}",
-        f"speaker_id={sender_id}",
-        f"speaker_name={speaker_name}",
-    ]
-    if speaker_role is None:
-        member = (member_lookup or {}).get(sender_id)
-        if member is not None:
-            speaker_role = str(member.get("role_summary") or "") or None
-            raw_position = member.get("position")
-            position = raw_position if isinstance(raw_position, int) else position
-    if speaker_role:
-        lines.append(f"speaker_role={speaker_role}")
-    if position is not None:
-        lines.append(f"position={position}")
-    lines.append(f"content={content}")
-    lines.append("[/record]")
-    return "\n".join(lines)
+    return prompt_builder_module._render_context_record(
+        sender_type=sender_type,
+        sender_id=sender_id,
+        content=content,
+        speaker_name=speaker_name,
+        event_id=event_id,
+        event_type=event_type,
+        visibility=visibility,
+        speaker_role=speaker_role,
+        position=position,
+        member_lookup=member_lookup,
+    )
 
 
 def _build_group_context_record_from_event(event: dict[str, Any]) -> str:
-    return _build_group_context_record(
-        sender_type=str(event.get("sender_type") or ""),
-        sender_id=str(event.get("sender_id") or ""),
-        content=str(event.get("content") or ""),
-        speaker_name=str(event.get("speaker_name") or ""),
-        event_id=str(event.get("event_id") or ""),
-        event_type=str(event.get("event_type") or ""),
-        visibility=str(event.get("visibility") or GROUP_RUNTIME_DEFAULT_EVENT_VISIBILITY),
-        speaker_role=(
-            str(event.get("speaker_role") or "")
-            if event.get("speaker_role") is not None
-            else None
-        ),
-        position=event.get("position") if isinstance(event.get("position"), int) else None,
-    )
+    return prompt_builder_module._render_context_record_from_event(event)
 
 
 def _build_group_event_window_messages(
     event_window: list[dict[str, Any]] | None,
 ) -> list[ChatMessage]:
-    messages: list[ChatMessage] = []
-    for event in event_window or []:
-        content = str(event.get("content") or "").strip()
-        if not content:
-            continue
-        if _is_group_runtime_trigger_event(event):
-            messages.append(ChatMessage(role="user", content=content))
-            continue
-        messages.append(ChatMessage(role="system", content=_build_group_context_record_from_event(event)))
-    return messages
+    return prompt_builder_module._build_group_event_window_messages(event_window)
 
 
 def _build_group_member_summary(
@@ -672,10 +344,7 @@ def _build_group_member_summary(
 
 
 def _format_group_member_order(member_summary: list[dict[str, Any]]) -> str:
-    return "\n".join(
-        f"{member['position']}. {member['agent_name']} ({member['agent_id']}) - {member['role_summary']}"
-        for member in member_summary
-    )
+    return prompt_builder_module._render_member_order(member_summary)
 
 
 def _build_group_member_lookup(member_summary: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
@@ -687,25 +356,17 @@ def _build_group_member_lookup(member_summary: list[dict[str, Any]] | None) -> d
 
 
 def _build_group_context_system_message(title: str, records: list[str]) -> ChatMessage | None:
-    normalized_records = [record.strip() for record in records if record.strip()]
-    if not normalized_records:
-        return None
-    return ChatMessage(role="system", content=f"{title}\n\n" + "\n\n".join(normalized_records))
+    return prompt_builder_module._build_group_context_system_message(title, records)
 
 
 def _build_group_context_preview_lines(
     history_messages: list[ChatMessage] | None = None,
     event_window: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    if event_window is not None:
-        return [
-            str(event.get("content") or "").strip()
-            for event in event_window
-            if str(event.get("content") or "").strip()
-        ]
-    return [
-        message.content.strip() for message in (history_messages or []) if message.content.strip()
-    ]
+    return prompt_builder_module._build_group_context_preview_lines(
+        history_messages=history_messages,
+        event_window=event_window,
+    )
 
 
 def _build_group_identity_system_message(
@@ -713,40 +374,10 @@ def _build_group_identity_system_message(
     member_summary: list[dict[str, Any]],
     replied_agent_ids: list[str] | None = None,
 ) -> ChatMessage | None:
-    if not member_summary:
-        return None
-
-    current_member = next(
-        (member for member in member_summary if member["agent_id"] == agent.id),
-        None,
-    )
-    if current_member is None:
-        return None
-
-    replied_agent_ids = [agent_id for agent_id in (replied_agent_ids or []) if agent_id != agent.id]
-    replied_names = [
-        member["agent_name"]
-        for member in member_summary
-        if member["agent_id"] in replied_agent_ids
-    ]
-    upcoming_names = [
-        member["agent_name"]
-        for member in member_summary
-        if member["position"] > current_member["position"]
-    ]
-    member_order_text = _format_group_member_order(member_summary) or "(空)"
-    replied_text = "、".join(replied_names) if replied_names else "当前轮次暂无其他成员已发言"
-    upcoming_text = "、".join(upcoming_names) if upcoming_names else "你是本轮最后一位发言成员"
-
-    return build_group_runtime_identity_system_message(
-        agent_name=agent.name,
-        agent_id=agent.id,
-        role_summary=agent.role_summary,
-        current_position=current_member["position"],
-        member_count=len(member_summary),
-        member_order_text=member_order_text,
-        replied_text=replied_text,
-        upcoming_text=upcoming_text,
+    return prompt_builder_module._build_group_identity_system_message(
+        agent,
+        member_summary,
+        replied_agent_ids=replied_agent_ids,
     )
 
 
@@ -758,36 +389,14 @@ def _build_group_protocol_system_messages(
     event_window: list[dict[str, Any]] | None = None,
     dispatch_state: dict[str, Any] | None = None,
 ) -> list[ChatMessage]:
-    if conversation.type != "group":
-        return []
-
-    messages = [build_group_runtime_protocol_system_message()]
-    identity_message = _build_group_identity_system_message(
+    return prompt_builder_module._build_group_protocol_system_messages(
+        conversation,
         agent,
-        member_summary or [],
+        member_summary=member_summary,
         replied_agent_ids=replied_agent_ids,
+        event_window=event_window,
+        dispatch_state=dispatch_state,
     )
-    if identity_message is not None:
-        messages.append(identity_message)
-    if dispatch_state is not None:
-        trigger_event = _resolve_group_trigger_event(
-            event_window=event_window,
-            dispatch_state=dispatch_state,
-        )
-        messages.append(
-            build_group_runtime_dispatch_system_message(
-                strategy=dispatch_state.get("strategy") or GROUP_RUNTIME_DEFAULT_DISPATCH_STRATEGY,
-                status=dispatch_state.get("status") or "running",
-                trigger_event_type=(trigger_event or {}).get("event_type") or "unknown",
-                completed_member_ids=list(dispatch_state.get("completed_member_ids") or []),
-                failed_member_ids=list(dispatch_state.get("failed_member_ids") or []),
-                pending_member_ids=list(dispatch_state.get("pending_member_ids") or []),
-            )
-        )
-    moderator_note = _get_group_moderator_note(conversation)
-    if moderator_note:
-        messages.append(build_group_runtime_moderator_note_system_message(moderator_note))
-    return messages
 
 
 def _build_group_moderator_note_prompt(
@@ -798,28 +407,13 @@ def _build_group_moderator_note_prompt(
     history_messages: list[ChatMessage] | None = None,
     event_window: list[dict[str, Any]] | None = None,
 ) -> str:
-    context_preview_lines = _build_group_context_preview_lines(
-        history_messages,
+    return prompt_builder_module._build_moderator_note_user_prompt(
+        conversation=conversation,
+        agent=agent,
+        content=content,
+        member_summary=member_summary,
+        history_messages=history_messages,
         event_window=event_window,
-    )
-    context_preview_text = "\n".join(context_preview_lines) if context_preview_lines else "(空)"
-    agent_position = next(
-        (
-            member["position"]
-            for member in member_summary
-            if member["agent_id"] == agent.id
-        ),
-        1,
-    )
-    return build_agent_group_moderator_note_prompt(
-        user_content=content,
-        member_count=len(member_summary),
-        member_order_text=_format_group_member_order(member_summary) or "(空)",
-        current_agent_name=agent.name,
-        current_agent_id=agent.id,
-        current_agent_position=agent_position,
-        has_source_context=bool(conversation.source_conversation_id),
-        context_preview_text=context_preview_text,
     )
 
 
@@ -913,23 +507,6 @@ def _resolve_group_speaker_name(
     return sender_id
 
 
-def _strip_group_speaker_prefix_once(content: str, prefix_candidates: list[str]) -> str:
-    for prefix in prefix_candidates:
-        normalized_prefix = prefix.strip()
-        if not normalized_prefix:
-            continue
-        escaped_prefix = re.escape(normalized_prefix)
-        patterns = (
-            rf"^{escaped_prefix}\s*[：:]\s*",
-            rf"^{escaped_prefix}\s+(?:updated|update)\s*[：:]\s*",
-        )
-        for pattern in patterns:
-            stripped = re.sub(pattern, "", content, count=1, flags=re.IGNORECASE).strip()
-            if stripped and stripped != content:
-                return stripped
-    return content
-
-
 def _normalize_legacy_group_content(
     sender_type: str,
     sender_id: str,
@@ -943,7 +520,7 @@ def _normalize_legacy_group_content(
     runtime_info = runtime_map.get(sender_id, {})
     prefix_candidates = [runtime_info.get("name", ""), sender_id]
     for _ in range(GROUP_REPLY_PREFIX_MAX_STRIPS):
-        updated = _strip_group_speaker_prefix_once(cleaned, prefix_candidates)
+        updated = strip_speaker_prefix_once(cleaned, prefix_candidates)
         if updated == cleaned:
             break
         cleaned = updated
@@ -1000,30 +577,10 @@ def build_group_context_messages(
     history_messages: list[ChatMessage] | None = None,
     event_window: list[dict[str, Any]] | None = None,
 ) -> list[ChatMessage]:
-    messages: list[ChatMessage] = []
-    history_records = [message.content for message in history_messages or [] if message.content.strip()]
-    history_context = _build_group_context_system_message("以下是当前群聊的历史记录。", history_records)
-    if history_context is not None:
-        messages.append(history_context)
-
-    current_round = _build_group_event_window_messages(event_window)
-    current_round_records = [
-        message.content
-        for message in current_round
-        if message.role == "system" and message.content.strip()
-    ]
-    if len(current_round_records) > MAX_GROUP_ROUND_MESSAGES:
-        current_round_records = current_round_records[-MAX_GROUP_ROUND_MESSAGES:]
-    round_context = _build_group_context_system_message(
-        "在你回复前，本轮已有以下成员完成发言。",
-        current_round_records,
+    return prompt_builder_module.build_group_context_messages(
+        history_messages=history_messages,
+        event_window=event_window,
     )
-    if round_context is not None:
-        messages.append(round_context)
-    current_user_message = next((message for message in current_round if message.role == "user"), None)
-    if current_user_message is not None and current_user_message.content.strip():
-        messages.append(ChatMessage(role="user", content=current_user_message.content.strip()))
-    return messages
 
 
 def build_chat_request(
@@ -1040,30 +597,17 @@ def build_chat_request(
     event_window: list[dict[str, Any]] | None = None,
     dispatch_state: dict[str, Any] | None = None,
 ) -> ChatRequest:
-    messages: list[ChatMessage] = []
-    system_message_content = _build_agent_system_message_content(agent)
-    if system_message_content.strip():
-        messages.append(ChatMessage(role="system", content=system_message_content))
-    if is_group:
-        messages.extend(
-            _build_group_protocol_system_messages(
-                conversation,
-                agent,
-                member_summary=member_summary,
-                replied_agent_ids=replied_agent_ids,
-                event_window=event_window,
-                dispatch_state=dispatch_state,
-            )
-        )
-        messages.extend(
-            build_group_context_messages(
-                history_messages,
-                event_window=event_window,
-            )
-        )
-    else:
-        messages.extend(history_messages or [])
-        messages.append(ChatMessage(role="user", content=content))
+    messages = prompt_builder_module.build_chat_messages(
+        conversation=conversation,
+        agent=agent,
+        content=content,
+        is_group=is_group,
+        history_messages=history_messages,
+        member_summary=member_summary,
+        replied_agent_ids=replied_agent_ids,
+        event_window=event_window,
+        dispatch_state=dispatch_state,
+    )
     attachment_refs = [AttachmentRef.from_mapping(attachment) for attachment in attachments or []]
     return ChatRequest(
         config=config,
@@ -1071,7 +615,6 @@ def build_chat_request(
         agent_id=agent.id,
         agent_name=agent.name,
         user_text=content,
-        system_prompt=agent.system_prompt,
         is_group=is_group,
         attachments=attachment_refs,
         thinking=ThinkingConfig(enabled=thinking_enabled),
@@ -1101,7 +644,7 @@ def generate_group_moderator_note(
     event_window: list[dict[str, Any]] | None = None,
 ) -> str:
     adapter_config = resolve_adapter_config(db, conversation, agent)
-    moderator_prompt = _build_group_moderator_note_prompt(
+    messages = prompt_builder_module.build_moderator_note_messages(
         conversation=conversation,
         agent=agent,
         content=content,
@@ -1115,20 +658,10 @@ def generate_group_moderator_note(
         .chat(
             ChatRequest(
                 config=candidate_config,
-                messages=[
-                    *(
-                        [ChatMessage(role="system", content=_build_agent_system_message_content(agent))]
-                        if agent.system_prompt.strip()
-                        else []
-                    ),
-                    build_group_runtime_protocol_system_message(),
-                    build_group_moderator_note_instruction_message(),
-                    ChatMessage(role="user", content=moderator_prompt),
-                ],
+                messages=messages,
                 agent_id=agent.id,
                 agent_name=agent.name,
                 user_text=content,
-                system_prompt=agent.system_prompt,
                 is_group=True,
                 thinking=ThinkingConfig(enabled=False),
                 metadata={
@@ -1144,29 +677,28 @@ def generate_group_moderator_note(
 
 def _replace_chat_request_config(request: ChatRequest, config: AdapterConfig) -> ChatRequest:
     """Return a new ChatRequest with the config replaced (for endpoint fallback)."""
-    return ChatRequest(
-        config=config,
-        messages=request.messages,
-        agent_id=request.agent_id,
-        agent_name=request.agent_name,
-        user_text=request.user_text,
-        system_prompt=request.system_prompt,
-        is_group=request.is_group,
-        attachments=request.attachments,
-        metadata=request.metadata,
-        tools=request.tools,
-        thinking=request.thinking,
-    )
+    return replace(request, config=config)
 
 
-def _build_tool_runtime_context(conversation: Conversation, agent: Agent) -> ToolRuntimeContext:
+def _build_tool_runtime_context(
+    db: Session,
+    conversation: Conversation,
+    agent: Agent,
+) -> ToolRuntimeContext:
     settings = get_settings()
+    search_config = build_search_runtime_config(settings)
+    services = ToolServices(db_session_factory=lambda: db)
     return ToolRuntimeContext(
         conversation_id=conversation.id,
         agent_id=agent.id,
         agent_name=agent.name,
         is_group=conversation.type == "group",
-        search_config=build_search_runtime_config(settings),
+        search_config=search_config,
+        services=services,
+        capabilities=ToolCapabilities(
+            search=SearchCapability(config=search_config),
+            services=services,
+        ),
     )
 
 
@@ -1186,7 +718,7 @@ def generate_agent_reply(
     on_tool_result: Any | None = None,
 ) -> ChatResponse | str:
     adapter_config = resolve_adapter_config(db, conversation, agent)
-    tool_context = _build_tool_runtime_context(conversation, agent)
+    tool_context = _build_tool_runtime_context(db, conversation, agent)
     chat_request = build_chat_request(
         config=adapter_config,
         conversation=conversation,
@@ -1307,158 +839,6 @@ def _ensure_group_moderator_note(
     return True
 
 
-def _sync_group_dispatch_state(
-    conversation: Conversation,
-    runtime_state: GroupRuntimeState,
-    *,
-    last_completed_event_id: str | None = None,
-) -> None:
-    runtime_state.dispatch_state = _build_group_dispatch_state(
-        trigger_event_id=runtime_state.dispatch_state.get("trigger_event_id"),
-        reply_agent_ids=runtime_state.reply_agent_ids,
-        completed_member_ids=runtime_state.emitted_agent_ids,
-        failed_member_ids=runtime_state.failed_agent_ids,
-        status=(
-            "completed"
-            if len(runtime_state.attempted_agent_ids) == len(runtime_state.reply_agent_ids)
-            else "running"
-        ),
-        last_completed_event_id=last_completed_event_id,
-    )
-    _update_group_default_thread_runtime(
-        conversation,
-        event_window=_serialize_group_event_window(runtime_state.event_window),
-        dispatch_state=runtime_state.dispatch_state,
-    )
-
-
-def _append_group_agent_reply(
-    conversation: Conversation,
-    runtime_state: GroupRuntimeState,
-    agent: Agent,
-    reply_message: Message,
-) -> None:
-    reply_event = _build_group_public_event(
-        event_type="agent_message",
-        sender_type="agent",
-        sender_id=agent.id,
-        content=reply_message.content,
-        speaker_name=agent.name,
-        member_lookup=runtime_state.member_lookup,
-        event_id=reply_message.id,
-        created_at=reply_message.created_at,
-    )
-    runtime_state.event_window = _append_group_public_event(runtime_state.event_window, reply_event)
-    if agent.id not in runtime_state.attempted_agent_ids:
-        runtime_state.attempted_agent_ids.append(agent.id)
-    if agent.id not in runtime_state.emitted_agent_ids:
-        runtime_state.emitted_agent_ids.append(agent.id)
-    if agent.id in runtime_state.failed_agent_ids:
-        runtime_state.failed_agent_ids = [
-            failed_agent_id
-            for failed_agent_id in runtime_state.failed_agent_ids
-            if failed_agent_id != agent.id
-        ]
-    _sync_group_dispatch_state(
-        conversation,
-        runtime_state,
-        last_completed_event_id=reply_message.id,
-    )
-
-
-def _mark_group_agent_failure(
-    conversation: Conversation,
-    runtime_state: GroupRuntimeState,
-    agent: Agent,
-) -> None:
-    if agent.id not in runtime_state.attempted_agent_ids:
-        runtime_state.attempted_agent_ids.append(agent.id)
-    if agent.id not in runtime_state.failed_agent_ids:
-        runtime_state.failed_agent_ids.append(agent.id)
-    _sync_group_dispatch_state(
-        conversation,
-        runtime_state,
-        last_completed_event_id=runtime_state.dispatch_state.get("last_completed_event_id"),
-    )
-
-
-def _run_group_agent_sequence(
-    db: Session,
-    conversation: Conversation,
-    content: str,
-    runtime_state: GroupRuntimeState,
-) -> Generator[tuple[Agent, Message], None, None]:
-    for reply_agent_id in runtime_state.reply_agent_ids:
-        agent = runtime_state.agent_map[reply_agent_id]
-        reply_kwargs: dict[str, Any] = {
-            "attachments": runtime_state.normalized_attachments,
-            "history_messages": runtime_state.history_messages,
-            "member_summary": runtime_state.member_summary,
-            "replied_agent_ids": list(runtime_state.emitted_agent_ids),
-            "event_window": runtime_state.event_window,
-            "dispatch_state": runtime_state.dispatch_state,
-        }
-        reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
-        reply_response = _coerce_chat_response(generate_agent_reply(
-            db,
-            conversation,
-            agent,
-            content,
-            **reply_kwargs,
-        ))
-        reply_response.content = sanitize_group_reply_content(agent, reply_response.content)
-        reply_message = _build_persisted_message(
-            conversation_id=conversation.id,
-            sender_type="agent",
-            sender_id=agent.id,
-            content=reply_response.content,
-            attachments=[],
-            response=reply_response,
-            created_at=utc_now_iso(),
-            round_index=len(runtime_state.emitted_agent_ids) + 1,
-            agent=agent,
-        )
-        db.add(reply_message)
-        runtime_state.conversation_usage_summary = _update_conversation_usage_from_response(
-            conversation,
-            reply_response,
-            agent=agent,
-        )
-        conversation.updated_at = reply_message.created_at
-        _append_group_agent_reply(conversation, runtime_state, agent, reply_message)
-        yield agent, reply_message
-
-
-def _strip_current_agent_reply_prefix_once(content: str, agent: Agent) -> str:
-    prefix_candidates = [agent.name.strip(), agent.id.strip()]
-    for prefix in prefix_candidates:
-        if not prefix:
-            continue
-        escaped_prefix = re.escape(prefix)
-        patterns = (
-            rf"^{escaped_prefix}\s*[：:]\s*",
-            rf"^{escaped_prefix}\s+(?:updated|update)\s*[：:]\s*",
-        )
-        for pattern in patterns:
-            stripped = re.sub(pattern, "", content, count=1, flags=re.IGNORECASE).strip()
-            if stripped and stripped != content:
-                return stripped
-    return content
-
-
-def sanitize_group_reply_content(agent: Agent, reply_content: str) -> str:
-    cleaned = reply_content.strip()
-    if not cleaned:
-        return cleaned
-
-    for _ in range(GROUP_REPLY_PREFIX_MAX_STRIPS):
-        updated = _strip_current_agent_reply_prefix_once(cleaned, agent)
-        if updated == cleaned:
-            break
-        cleaned = updated
-    return cleaned
-
-
 def _filter_callable_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     parameters = signature(func).parameters.values()
     if any(parameter.kind == Parameter.VAR_KEYWORD for parameter in parameters):
@@ -1513,55 +893,27 @@ def send_message(
         agent_messages = []
         for reply_agent_id in runtime_state.reply_agent_ids:
             agent = runtime_state.agent_map[reply_agent_id]
-            reply_kwargs: dict[str, Any] = {
-                "thinking_enabled": thinking_enabled,
-                "attachments": runtime_state.normalized_attachments,
-                "history_messages": runtime_state.history_messages,
-                "member_summary": runtime_state.member_summary,
-                "replied_agent_ids": list(runtime_state.emitted_agent_ids),
-                "event_window": runtime_state.event_window,
-                "dispatch_state": runtime_state.dispatch_state,
-            }
-            reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
-            try:
-                reply_response = _coerce_chat_response(generate_agent_reply(
-                    db,
-                    conversation,
-                    agent,
-                    content,
-                    **reply_kwargs,
-                ))
-                reply_response.content = sanitize_group_reply_content(agent, reply_response.content)
-                _ensure_agent_response_displayable(
-                    reply_response,
-                    allow_thinking_display=thinking_enabled,
-                    agent_name=agent.name,
+            outcome = run_single_group_agent_turn(
+                db,
+                conversation,
+                agent,
+                content,
+                runtime_state,
+                thinking_enabled=thinking_enabled,
+                generate_agent_reply=generate_agent_reply,
+                coerce_chat_response=_coerce_chat_response,
+                ensure_displayable=_ensure_agent_response_displayable,
+                build_persisted_message=_build_persisted_message,
+                update_usage=_update_conversation_usage_from_response,
+                filter_callable_kwargs=_filter_callable_kwargs,
+            )
+            if outcome.failed:
+                warnings.append(
+                    _build_contextual_error_payload(f"{agent.name} 回复失败", outcome.error or Exception())
                 )
-                reply_message = _build_persisted_message(
-                    conversation_id=conversation.id,
-                    sender_type="agent",
-                    sender_id=agent.id,
-                    content=reply_response.content,
-                    attachments=[],
-                    response=reply_response,
-                    created_at=utc_now_iso(),
-                    round_index=len(runtime_state.emitted_agent_ids) + 1,
-                    agent=agent,
-                    allow_thinking_display=thinking_enabled,
-                )
-                db.add(reply_message)
-                runtime_state.conversation_usage_summary = _update_conversation_usage_from_response(
-                    conversation,
-                    reply_response,
-                    agent=agent,
-                )
-                conversation.updated_at = reply_message.created_at
-                _append_group_agent_reply(conversation, runtime_state, agent, reply_message)
-                agent_messages.append(reply_message)
-            except Exception as exc:
-                _mark_group_agent_failure(conversation, runtime_state, agent)
-                warnings.append(_build_contextual_error_payload(f"{agent.name} 回复失败", exc))
                 continue
+            if outcome.reply_message is not None:
+                agent_messages.append(outcome.reply_message)
     else:
         warnings = []
         reply_agent_ids = [conversation.agent_id] if conversation.agent_id else []
@@ -1621,23 +973,6 @@ def send_message(
         conversation_usage_summary=usage_summary_to_dict(get_conversation_usage_summary(conversation)),
         warnings=warnings,
     )
-
-
-def _build_stream_error_payload(exc: Exception) -> dict[str, str]:
-    if isinstance(exc, LLMValidationError):
-        return {"code": exc.code, "message": str(exc)}
-    if isinstance(exc, EndpointFallbackError):
-        return {"code": "model_endpoint_failed", "message": str(exc)}
-    if isinstance(exc, ValueError):
-        return {"code": "model_request_failed", "message": str(exc)}
-    return {"code": "stream_generation_failed", "message": str(exc) or "群聊运行失败"}
-
-
-def _build_contextual_error_payload(prefix: str, exc: Exception) -> dict[str, str]:
-    payload = _build_stream_error_payload(exc)
-    message = payload.get("message", "").strip() or "群聊运行失败"
-    payload["message"] = f"{prefix}：{message}"
-    return payload
 
 
 def stream_group_message(
@@ -1732,16 +1067,6 @@ def stream_group_message(
             )
     for reply_agent_id in runtime_state.reply_agent_ids:
         agent = runtime_state.agent_map[reply_agent_id]
-        reply_kwargs: dict[str, Any] = {
-            "thinking_enabled": thinking_enabled,
-            "attachments": runtime_state.normalized_attachments,
-            "history_messages": runtime_state.history_messages,
-            "member_summary": runtime_state.member_summary,
-            "replied_agent_ids": list(runtime_state.emitted_agent_ids),
-            "event_window": runtime_state.event_window,
-            "dispatch_state": runtime_state.dispatch_state,
-        }
-
         tool_events_buffer: list[tuple[str, dict[str, Any]]] = []
 
         def on_tool_call(tc):
@@ -1764,45 +1089,25 @@ def stream_group_message(
                 "result_preview": result[:500],
             }))
 
-        reply_kwargs["on_tool_call"] = on_tool_call
-        reply_kwargs["on_tool_result"] = on_tool_result
-        reply_kwargs = _filter_callable_kwargs(generate_agent_reply, reply_kwargs)
+        outcome = run_single_group_agent_turn(
+            db,
+            conversation,
+            agent,
+            content,
+            runtime_state,
+            thinking_enabled=thinking_enabled,
+            generate_agent_reply=generate_agent_reply,
+            coerce_chat_response=_coerce_chat_response,
+            ensure_displayable=_ensure_agent_response_displayable,
+            build_persisted_message=_build_persisted_message,
+            update_usage=_update_conversation_usage_from_response,
+            filter_callable_kwargs=_filter_callable_kwargs,
+            on_tool_call=on_tool_call,
+            on_tool_result=on_tool_result,
+        )
 
-        try:
-            reply_response = _coerce_chat_response(generate_agent_reply(
-                db,
-                conversation,
-                agent,
-                content,
-                **reply_kwargs,
-            ))
-            reply_response.content = sanitize_group_reply_content(agent, reply_response.content)
-            _ensure_agent_response_displayable(
-                reply_response,
-                allow_thinking_display=thinking_enabled,
-                agent_name=agent.name,
-            )
-            reply_message = _build_persisted_message(
-                conversation_id=conversation.id,
-                sender_type="agent",
-                sender_id=agent.id,
-                content=reply_response.content,
-                attachments=[],
-                response=reply_response,
-                created_at=utc_now_iso(),
-                round_index=len(runtime_state.emitted_agent_ids) + 1,
-                agent=agent,
-                allow_thinking_display=thinking_enabled,
-            )
-            db.add(reply_message)
-            runtime_state.conversation_usage_summary = _update_conversation_usage_from_response(
-                conversation,
-                reply_response,
-                agent=agent,
-            )
-            conversation.updated_at = reply_message.created_at
-            _append_group_agent_reply(conversation, runtime_state, agent, reply_message)
-        except Exception as exc:
+        if outcome.failed:
+            exc = outcome.error or Exception()
             db.rollback()
             db.refresh(conversation)
             _mark_group_agent_failure(conversation, runtime_state, agent)
@@ -1845,6 +1150,9 @@ def stream_group_message(
                     ),
                 },
             )
+            continue
+        reply_message = outcome.reply_message
+        if reply_message is None:
             continue
         try:
             db.commit()

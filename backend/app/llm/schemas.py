@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+from app.services.search_types import SearchRuntimeConfigSnapshot
+
+if TYPE_CHECKING:
+    from app.llm.tools.capabilities import ToolCapabilities
+    from app.llm.tools.tool_services import ToolServices
 
 
 @dataclass(slots=True)
@@ -50,6 +56,9 @@ class AttachmentRef:
 class ToolParameterProperty:
     type: str
     description: str = ""
+    enum: list[Any] | None = None
+    items: dict[str, Any] | None = None
+    default: Any | None = None
 
 
 @dataclass(slots=True)
@@ -152,20 +161,10 @@ class ToolResultEvent:
 
 
 @dataclass(slots=True)
-class SearchRuntimeConfigSnapshot:
-    web_search_enabled: bool = True
-    fallback_enabled: bool = True
-    primary_provider: str = "searxng"
-    fallback_providers: list[str] = field(default_factory=list)
-    cache_ttl_seconds: int = 3600
-    cache_max_size: int = 1000
-    max_results: int = 5
-    request_timeout_seconds: int = 10
-    searxng_base_url: str | None = None
-    bocha_api_key: str = ""
-    bocha_base_url: str | None = None
-    tavily_api_key: str = ""
-    tavily_base_url: str | None = None
+class ToolResult:
+    text: str
+    data: dict[str, Any] = field(default_factory=dict)
+    is_error: bool = False
 
 
 @dataclass(slots=True)
@@ -175,6 +174,8 @@ class ToolRuntimeContext:
     agent_name: str = ""
     is_group: bool = False
     search_config: SearchRuntimeConfigSnapshot = field(default_factory=SearchRuntimeConfigSnapshot)
+    services: "ToolServices | None" = None
+    capabilities: "ToolCapabilities | None" = None
 
 
 @dataclass(slots=True)
@@ -210,7 +211,6 @@ class ChatRequest:
     agent_id: str
     agent_name: str
     user_text: str
-    system_prompt: str = ""
     is_group: bool = False
     attachments: list[AttachmentRef] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -10,9 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.common import error_response
 from app.db import get_db
-from app.llm.endpoint_fallback import EndpointFallbackError
 from app.llm.usage import usage_summary_to_dict
-from app.llm.validator import LLMStreamInterruptedError, LLMValidationError
 from app.models import Conversation, Message
 from app.schemas import (
     ErrorDetail,
@@ -25,6 +23,11 @@ from app.schemas import (
     MessagesPageResponse,
 )
 from app.services.chat_service import get_conversation_usage_summary, send_message, stream_group_message
+from app.services.stream_errors import (
+    build_stream_error_payload,
+    resolve_message_error_status,
+    should_handle_message_exception,
+)
 
 router = APIRouter(tags=["messages"])
 
@@ -165,14 +168,15 @@ def post_message(payload: MessageCreate, db: Session = Depends(get_db)):
                 },
             ),
         )
-    except LLMValidationError as exc:
-        return error_response(exc.status_code, exc.code, str(exc))
-    except LLMStreamInterruptedError as exc:
-        return error_response(422, "model_stream_interrupted", str(exc))
-    except EndpointFallbackError as exc:
-        return error_response(422, "model_endpoint_failed", str(exc))
-    except ValueError as exc:
-        return error_response(422, "model_request_failed", str(exc))
+    except Exception as exc:
+        if not should_handle_message_exception(exc):
+            raise
+        payload = build_stream_error_payload(exc)
+        return error_response(
+            resolve_message_error_status(exc, payload["code"]),
+            payload["code"],
+            payload["message"],
+        )
 
     return MessageSendResponse(
         user_message=serialize_message(result.user_message),

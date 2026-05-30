@@ -58,6 +58,13 @@ def test_is_web_search_available_respects_runtime_config(monkeypatch):
     assert is_web_search_available(_config(web_search_enabled=False)) is False
 
 
+def test_search_runtime_config_snapshot_importable_from_search_types():
+    from app.services.search_types import SearchRuntimeConfigSnapshot
+
+    snap = SearchRuntimeConfigSnapshot()
+    assert snap.web_search_enabled is True
+
+
 def test_build_search_runtime_config_includes_bocha_settings():
     from app.services.search_service import build_search_runtime_config
 

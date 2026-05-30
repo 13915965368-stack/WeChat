@@ -40,10 +40,10 @@ def build_group_runtime_identity_system_message(
             f"- 你的显示名：{agent_name} ({agent_id})\n"
             f"- 你的角色定位：{role_summary}\n"
             f"- 你的当前顺位：第 {current_position} 位，共 {member_count} 位成员\n"
-            f"- 当前群聊成员与顺序：\n{member_order_text}\n"
+            f"- 当前群聊成员：\n{member_order_text}\n"
             f"- 在你之前已完成当前轮次发言的成员：{replied_text}\n"
-            f"- 在你之后将继续接力的成员：{upcoming_text}\n"
-            "- 你不能只靠转录稿猜身份；以上顺序和身份信息就是当前群结构。\n"
+            # f"- 在你之后将继续接力的成员：{upcoming_text}\n"
+            "- 你不能只靠转录稿猜身份；以上身份信息就是当前群结构。\n"
             "- 发言者身份会由显示层单独展示；公开回复只需要写出你这轮真正要表达的内容。\n"
             "- 如果下方出现群聊上下文记录，其中的 speaker 字段是运行时元数据，不是公开回复模板。"
         ),
@@ -68,7 +68,7 @@ def build_group_runtime_dispatch_system_message(
             f"- 触发事件类型：{trigger_event_type}\n"
             f"- 当前已完成成员：{', '.join(completed_member_ids) or '(空)'}\n"
             f"- 当前失败成员：{', '.join(failed_member_ids) or '(空)'}\n"
-            f"- 当前待发言成员：{', '.join(pending_member_ids) or '(空)'}\n"
+            # f"- 当前待发言成员：{', '.join(pending_member_ids) or '(空)'}\n"
             "- 你需要承接当前公开事件窗口里最新的状态继续推进，不要把窗口里的记录当成公开回复模板。"
         ),
     )

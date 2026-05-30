@@ -18,11 +18,24 @@ from app.llm.validator import (
 class GeminiAdapter(BaseLLMAdapter):
     adapter_name = "gemini"
 
+    def _serialize_tool_property(self, prop) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "type": prop.type.upper(),
+            "description": prop.description,
+        }
+        if prop.enum is not None:
+            payload["enum"] = prop.enum
+        if prop.items is not None:
+            payload["items"] = prop.items
+        if prop.default is not None:
+            payload["default"] = prop.default
+        return payload
+
     def _build_headers(self) -> dict[str, str]:
         return self._build_default_headers()
 
     def _build_payload(self, request: ChatRequest) -> dict[str, object]:
-        system_prompt, messages = self._split_system_and_messages(request)
+        system_text, messages = self._split_system_and_messages(request)
         contents = [
             {
                 "role": "model" if message["role"] == "assistant" else "user",
@@ -34,8 +47,8 @@ class GeminiAdapter(BaseLLMAdapter):
         contents = self._serialize_messages_with_tools(request, contents)
 
         payload: dict[str, object] = {"contents": contents}
-        if system_prompt:
-            payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+        if system_text:
+            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
         generation_config = build_thinking_provider_overrides(request)
         if generation_config:
             payload["generationConfig"] = generation_config
@@ -49,7 +62,7 @@ class GeminiAdapter(BaseLLMAdapter):
                         "parameters": {
                             "type": tool.parameters.type.upper(),
                             "properties": {
-                                k: {"type": v.type.upper(), "description": v.description}
+                                k: self._serialize_tool_property(v)
                                 for k, v in tool.parameters.properties.items()
                             },
                             "required": tool.parameters.required,

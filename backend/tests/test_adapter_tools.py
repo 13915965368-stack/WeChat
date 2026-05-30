@@ -77,6 +77,28 @@ class TestOpenAICompatibleTools:
         assert tool["function"]["name"] == "web_search"
         assert tool["function"]["parameters"]["required"] == ["query"]
 
+    def test_openai_payload_serializes_enum_parameter(self):
+        adapter = OpenAICompatibleAdapter(_make_config())
+        tool = ToolDefinition(
+            name="set_scope",
+            description="Set scope",
+            parameters=ToolParameters(
+                properties={
+                    "scope": ToolParameterProperty(
+                        type="string",
+                        description="scope",
+                        enum=["thread", "conversation"],
+                    )
+                },
+                required=["scope"],
+            ),
+        )
+        payload = adapter._build_payload(_make_request(tools=[tool]))
+        assert payload["tools"][0]["function"]["parameters"]["properties"]["scope"]["enum"] == [
+            "thread",
+            "conversation",
+        ]
+
     def test_extract_tool_calls_empty(self):
         adapter = OpenAICompatibleAdapter(_make_config())
         data = {

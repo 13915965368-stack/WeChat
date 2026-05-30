@@ -3,10 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 from app.config import Settings
-from app.llm.schemas import SearchRuntimeConfigSnapshot
 from app.services.search_cache import SearchCache
 from app.services.search_providers import SEARCH_PROVIDERS
-from app.services.search_types import SearchAttempt, SearchResponse
+from app.services.search_types import SearchAttempt, SearchResponse, SearchRuntimeConfigSnapshot
 
 _SEARCH_CACHE: SearchCache | None = None
 _SEARCH_CACHE_SIZE: int | None = None

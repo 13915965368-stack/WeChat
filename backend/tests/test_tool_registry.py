@@ -1,9 +1,13 @@
 """Tests for the tool registry."""
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from app.llm.tools.registry import clear_tools, execute_tool, get_global_tool_definitions, register_tool
+from app.llm.schemas import ToolResult
+from app.llm.tools import registry as tool_registry
+from app.llm.tools.registry import clear_tools, execute_tool, execute_tool_full, get_global_tool_definitions, register_tool
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +84,45 @@ class TestExecuteTool:
         result = execute_tool("failing", {})
         assert "Error" in result
         assert "something went wrong" in result
+
+    def test_execute_tool_supports_tool_result_return(self):
+        register_tool(
+            name="struct_tool",
+            description="Structured tool",
+            parameters={},
+            required=[],
+            executor=lambda: ToolResult(text="ok", data={"n": 1}, is_error=False),
+        )
+        result = execute_tool("struct_tool", {})
+        assert result == "ok"
+
+    def test_execute_tool_plain_str_still_works(self):
+        register_tool(
+            name="plain_tool",
+            description="Plain tool",
+            parameters={},
+            required=[],
+            executor=lambda: "hi",
+        )
+        assert execute_tool("plain_tool", {}) == "hi"
+
+    def test_execute_tool_times_out(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(tool_registry, "TOOL_EXECUTION_TIMEOUT_SECONDS", 1, raising=False)
+
+        def slow_tool():
+            time.sleep(tool_registry.TOOL_EXECUTION_TIMEOUT_SECONDS + 1)
+            return "done"
+
+        register_tool(
+            name="slow",
+            description="Slow tool",
+            parameters={},
+            required=[],
+            executor=slow_tool,
+        )
+        result = execute_tool_full("slow", {})
+        assert result.is_error is True
+        assert "timeout" in result.text.lower()
 
 
 class TestClearTools:

@@ -13,6 +13,7 @@ from app.llm.endpoint_fallback import run_with_endpoint_fallback
 from app.llm.schemas import AdapterCapabilities, AdapterConfig
 from app.models import Agent, ModelConfig
 from app.security import decrypt_secret, encrypt_secret
+from app.services.adapter_config_factory import build_adapter_config_from_model
 from app.schemas import (
     ModelConfigCapabilities,
     ModelConfigCreateRequest,
@@ -160,20 +161,7 @@ def _prevalidate_model_config(model_config: ModelConfig) -> str | None:
 
 
 def _build_adapter_config(model_config: ModelConfig) -> AdapterConfig:
-    settings = get_settings()
-    return AdapterConfig(
-        provider=model_config.provider,
-        model=model_config.model,
-        api_key=decrypt_secret(model_config.api_key_encrypted, settings),
-        api_format=model_config.api_format,
-        base_url=model_config.base_url,
-        use_full_url=model_config.use_full_url,
-        capabilities=AdapterCapabilities.from_mapping(model_config.capabilities),
-        metadata={
-            "model_config_id": model_config.id,
-            "source": "model_config_validation",
-        },
-    )
+    return build_adapter_config_from_model(model_config, source="model_config_validation")
 
 
 def _sync_bound_agents(db: Session, model_config_id: str, *, is_available: bool) -> None:

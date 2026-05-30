@@ -240,8 +240,8 @@ class BaseLLMAdapter(ABC):
             if message.role == "tool" or message.tool_calls:
                 continue
             messages.append({"role": message.role, "content": content})
-        system_prompt = "\n\n".join(system_parts).strip()
-        return (system_prompt or None, messages)
+        merged_system_text = "\n\n".join(system_parts).strip()
+        return (merged_system_text or None, messages)
 
     def _extract_text_content(self, value: Any, *, strip: bool = True) -> str:
         if isinstance(value, str):

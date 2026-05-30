@@ -153,8 +153,10 @@ export function SettingsPanel({
   return (
     <>
       <aside
-        className="flex w-[420px] flex-col border-l"
+        data-testid="settings-panel"
+        className="flex w-[680px] min-w-0 flex-col border-l"
         style={{
+          width: "min(680px, calc(100vw - 48px))",
           background: "var(--bg-card)",
           borderColor: "var(--border-light)",
         }}
@@ -182,7 +184,7 @@ export function SettingsPanel({
           </button>
         </div>
 
-        <div className="flex-1 overflow-hidden px-4 py-4">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden px-5 py-5">
           <div className="grid grid-cols-2 gap-3">
           <div
             className="rounded-2xl border px-4 py-3"

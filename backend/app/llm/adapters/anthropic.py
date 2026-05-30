@@ -17,6 +17,19 @@ from app.llm.validator import (
 class AnthropicAdapter(BaseLLMAdapter):
     adapter_name = "anthropic"
 
+    def _serialize_tool_property(self, prop) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "type": prop.type,
+            "description": prop.description,
+        }
+        if prop.enum is not None:
+            payload["enum"] = prop.enum
+        if prop.items is not None:
+            payload["items"] = prop.items
+        if prop.default is not None:
+            payload["default"] = prop.default
+        return payload
+
     def _build_headers(self) -> dict[str, str]:
         headers = self._build_default_headers()
         headers["x-api-key"] = self._require_api_key()
@@ -24,7 +37,7 @@ class AnthropicAdapter(BaseLLMAdapter):
         return headers
 
     def _build_payload(self, request: ChatRequest, *, max_tokens: int, stream: bool = False) -> dict[str, object]:
-        system_prompt, messages = self._split_system_and_messages(request)
+        system_text, messages = self._split_system_and_messages(request)
         serialized_messages = [
             {
                 "role": message["role"],
@@ -40,8 +53,8 @@ class AnthropicAdapter(BaseLLMAdapter):
             "max_tokens": max_tokens,
             "messages": serialized_messages,
         }
-        if system_prompt:
-            payload["system"] = system_prompt
+        if system_text:
+            payload["system"] = system_text
         if stream:
             payload["stream"] = True
         payload.update(build_thinking_provider_overrides(request))
@@ -54,7 +67,7 @@ class AnthropicAdapter(BaseLLMAdapter):
                     "input_schema": {
                         "type": tool.parameters.type,
                         "properties": {
-                            k: {"type": v.type, "description": v.description}
+                            k: self._serialize_tool_property(v)
                             for k, v in tool.parameters.properties.items()
                         },
                         "required": tool.parameters.required,

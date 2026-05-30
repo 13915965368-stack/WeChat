@@ -23,8 +23,8 @@ export function ModelConfigTable({
 }: Props) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex items-start justify-between">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
           <h3 className="text-lg font-semibold text-[#2D2926]">模型管理</h3>
           <p className="mt-1 text-xs" style={{ color: "var(--text-tertiary)" }}>
             配置 API key，添加可用模型，预置模型默认使用稳定版本。
@@ -32,10 +32,10 @@ export function ModelConfigTable({
         </div>
         <button
           onClick={onCreate}
-          className="inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-medium text-white transition-all duration-200 hover:shadow-md whitespace-nowrap shrink-0"
+          className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-xl px-4 py-2 text-sm font-medium text-white transition-shadow duration-200 hover:shadow-md"
           style={{ background: "#5B7BA3", boxShadow: "0 4px 12px rgba(91, 123, 163, 0.22)" }}
         >
-          <span className="text-lg leading-none">+</span>
+          <span aria-hidden="true" className="text-lg leading-none">+</span>
           添加模型
         </button>
       </div>
@@ -61,23 +61,7 @@ export function ModelConfigTable({
           boxShadow: "var(--shadow-soft)",
         }}
       >
-        <div
-          className="grid grid-cols-[1.4fr_1.3fr_0.8fr_1.4fr_0.8fr_1fr] items-center gap-4 border-b px-5 py-3 text-[11px] font-semibold uppercase tracking-[0.14em]"
-          style={{
-            background: "var(--bg-secondary)",
-            borderColor: "var(--border-light)",
-            color: "var(--text-tertiary)",
-          }}
-        >
-          <span>模型</span>
-          <span>提供商</span>
-          <span>状态</span>
-          <span>能力</span>
-          <span>上下文</span>
-          <span>操作</span>
-        </div>
-
-        <div className="max-h-[calc(100vh-220px)] overflow-y-auto">
+        <div className="max-h-[calc(100vh-240px)] overflow-y-auto p-4">
           {isLoading ? (
             <div className="px-5 py-10 text-center text-sm" style={{ color: "var(--text-secondary)" }}>
               正在读取模型配置...
@@ -97,92 +81,131 @@ export function ModelConfigTable({
               </p>
               <button
                 onClick={onCreate}
-                className="mt-4 inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-medium text-white transition-all duration-200 hover:shadow-md whitespace-nowrap shrink-0"
+                className="mt-4 inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-xl px-4 py-2 text-sm font-medium text-white transition-shadow duration-200 hover:shadow-md"
                 style={{ background: "#5B7BA3", boxShadow: "0 4px 12px rgba(91, 123, 163, 0.22)" }}
               >
-                <span className="text-lg leading-none">+</span>
+                <span aria-hidden="true" className="text-lg leading-none">+</span>
                 添加首个模型
               </button>
             </div>
           ) : (
-            modelConfigs.map((modelConfig) => (
-              <div
-                key={modelConfig.id}
-                className="grid grid-cols-[1.4fr_1.3fr_0.8fr_1.4fr_0.8fr_1fr] items-start gap-4 border-b px-5 py-4 last:border-b-0"
-                style={{ borderColor: "var(--border-light)" }}
-              >
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-[#2D2926]">
-                    {modelConfig.displayName}
+            <div className="space-y-3">
+              {modelConfigs.map((modelConfig) => (
+                <article
+                  key={modelConfig.id}
+                  className="rounded-2xl border px-4 py-4"
+                  style={{
+                    background: "var(--bg-card)",
+                    borderColor: "var(--border-light)",
+                    boxShadow: "0 8px 20px rgba(45, 41, 38, 0.04)",
+                  }}
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <h4 className="break-words text-sm font-semibold text-[#2D2926]">
+                        {modelConfig.displayName}
+                      </h4>
+                      <p className="mt-1 break-words text-sm" style={{ color: "var(--text-secondary)" }}>
+                        {modelConfig.provider} - {modelConfig.model}
+                      </p>
+                    </div>
+                    <div className="shrink-0">
+                      <ModelStatusBadge status={modelConfig.status} />
+                    </div>
                   </div>
+
                   {modelConfig.statusMessage ? (
                     <p
-                      className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-xs"
-                      style={{ color: "var(--text-tertiary)" }}
+                      className="mt-3 whitespace-pre-wrap break-words rounded-xl border px-3 py-2 text-xs"
+                      style={{
+                        background: "var(--bg-secondary)",
+                        borderColor: "var(--border-light)",
+                        color: "var(--text-tertiary)",
+                      }}
                     >
                       {modelConfig.statusMessage}
                     </p>
                   ) : null}
-                </div>
 
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-medium" style={{ color: "var(--text-secondary)" }}>
-                    {modelConfig.provider} - {modelConfig.model}
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    <div className="min-w-0">
+                      <p
+                        className="text-[11px] font-semibold uppercase tracking-[0.12em]"
+                        style={{ color: "var(--text-tertiary)" }}
+                      >
+                        地址
+                      </p>
+                      <p className="mt-1 break-all text-xs" style={{ color: "var(--text-secondary)" }}>
+                        {modelConfig.useFullUrl ? "完整 URL" : modelConfig.baseUrl}
+                      </p>
+                    </div>
+                    <div className="min-w-0">
+                      <p
+                        className="text-[11px] font-semibold uppercase tracking-[0.12em]"
+                        style={{ color: "var(--text-tertiary)" }}
+                      >
+                        输入上下文
+                      </p>
+                      <p className="mt-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+                        {modelConfig.contextWindowInput
+                          ? `${Math.round(modelConfig.contextWindowInput / 1000)}K`
+                          : "未声明"}
+                      </p>
+                    </div>
+                    <div className="min-w-0 sm:col-span-2">
+                      <p
+                        className="text-[11px] font-semibold uppercase tracking-[0.12em]"
+                        style={{ color: "var(--text-tertiary)" }}
+                      >
+                        能力
+                      </p>
+                      <div className="mt-2">
+                        <ModelCapabilityBadges model={modelConfig} />
+                      </div>
+                    </div>
                   </div>
-                  <p className="mt-1 text-xs" style={{ color: "var(--text-tertiary)" }}>
-                    {modelConfig.useFullUrl ? "完整 URL" : modelConfig.baseUrl}
-                  </p>
-                </div>
 
-                <div>
-                  <ModelStatusBadge status={modelConfig.status} />
-                </div>
-
-                <ModelCapabilityBadges model={modelConfig} />
-
-                <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                  {modelConfig.contextWindowInput
-                    ? `${Math.round(modelConfig.contextWindowInput / 1000)}K`
-                    : "未声明"}
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    onClick={() => onEdit(modelConfig)}
-                    className="rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors"
-                    style={{
-                      background: "var(--bg-secondary)",
-                      borderColor: "var(--border-medium)",
-                      color: "var(--text-secondary)",
-                    }}
+                  <div
+                    className="mt-4 flex flex-wrap items-center gap-2 border-t pt-4"
+                    style={{ borderColor: "var(--border-light)" }}
                   >
-                    编辑
-                  </button>
-                  <button
-                    onClick={() => onValidate(modelConfig.id)}
-                    className="rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors"
-                    style={{
-                      background: "#EEF4FA",
-                      borderColor: "#D8E4F1",
-                      color: "#5B7BA3",
-                    }}
-                  >
-                    重新校验
-                  </button>
-                  <button
-                    onClick={() => onDelete(modelConfig)}
-                    className="rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors"
-                    style={{
-                      background: "#FFF5F5",
-                      borderColor: "#F3D8D8",
-                      color: "#B85E5E",
-                    }}
-                  >
-                    删除
-                  </button>
-                </div>
-              </div>
-            ))
+                    <button
+                      onClick={() => onEdit(modelConfig)}
+                      className="rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors"
+                      style={{
+                        background: "var(--bg-secondary)",
+                        borderColor: "var(--border-medium)",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      编辑
+                    </button>
+                    <button
+                      onClick={() => onValidate(modelConfig.id)}
+                      className="rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors"
+                      style={{
+                        background: "#EEF4FA",
+                        borderColor: "#D8E4F1",
+                        color: "#5B7BA3",
+                      }}
+                    >
+                      重新校验
+                    </button>
+                    <button
+                      onClick={() => onDelete(modelConfig)}
+                      className="rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors"
+                      style={{
+                        background: "#FFF5F5",
+                        borderColor: "#F3D8D8",
+                        color: "#B85E5E",
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
           )}
         </div>
       </div>

@@ -6,7 +6,6 @@ type Props = {
     | "supportsImageInput"
     | "supportsFileInput"
     | "supportsStreaming"
-    | "contextWindowInput"
   >;
 };
 
@@ -66,9 +65,6 @@ export function ModelCapabilityBadges({ model }: Props) {
         label={model.supportsStreaming ? "Streaming" : "非流式"}
         tone={model.supportsStreaming ? "neutral" : "muted"}
       />
-      {model.contextWindowInput ? (
-        <SmallBadge label={`${Math.round(model.contextWindowInput / 1000)}K ctx`} />
-      ) : null}
     </div>
   );
 }

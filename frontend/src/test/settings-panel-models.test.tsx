@@ -45,9 +45,18 @@ describe("SettingsPanel 模型管理", () => {
       />
     );
 
+    expect(screen.getByTestId("settings-panel")).toHaveClass("w-[680px]");
     expect(screen.getByText("模型管理")).toBeInTheDocument();
     expect(screen.getByText("OpenAI - gpt-4o")).toBeInTheDocument();
+    expect(screen.getByText("地址")).toBeInTheDocument();
+    expect(screen.getByText("能力")).toBeInTheDocument();
+    expect(screen.getByText("输入上下文")).toBeInTheDocument();
     expect(screen.getAllByText("支持图片").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "添加模型" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "编辑" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新校验" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "删除" })).toBeInTheDocument();
+    expect(screen.queryByText("上下文")).not.toBeInTheDocument();
   });
 
   it("删除前会展示受影响 Agent 提示", () => {

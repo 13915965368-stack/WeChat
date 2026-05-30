@@ -1351,7 +1351,6 @@ def test_post_message_passes_system_prompt_and_trimmed_history_to_adapter(client
     assert response.status_code == 201
     request = captured["request"]
     assert isinstance(request, ChatRequest)
-    assert request.system_prompt == "你是一个偏系统性与结构化思考的智能助手。"
     assert request.messages[0].role == "system"
     assert "Markdown 输出格式要求：" in request.messages[0].content
     assert request.messages[0].content.startswith("你是一个偏系统性与结构化思考的智能助手。")
@@ -1380,7 +1379,6 @@ def test_post_group_message_uses_shared_history_for_each_agent_and_fixed_member_
             captured_requests.append(
                 {
                     "agent_id": request.agent_id,
-                    "system_prompt": request.system_prompt,
                     "messages": [(message.role, message.content) for message in request.messages],
                     "metadata": dict(request.metadata),
                 }
@@ -1425,13 +1423,6 @@ def test_post_group_message_uses_shared_history_for_each_agent_and_fixed_member_
     ]
     assert captured_requests[0]["metadata"]["purpose"] == "group_moderator_note"
     public_requests = captured_requests[1:]
-    assert {
-        item["system_prompt"] for item in public_requests
-    } == {
-        "你是一个偏系统性与结构化思考的智能助手。",
-        "你是一个偏风险识别和问题质疑的智能助手。",
-        "你是一个偏表达整理和内容组织的智能助手。",
-    }
     assert all(
         item["metadata"]["group_protocol_version"] == "group_runtime_v1"
         and item["metadata"]["moderator_note_present"] is True
@@ -1458,6 +1449,18 @@ def test_post_group_message_uses_shared_history_for_each_agent_and_fixed_member_
     architect_system_messages = [content for role, content in public_requests[0]["messages"] if role == "system"]
     critic_system_messages = [content for role, content in public_requests[1]["messages"] if role == "system"]
     writer_system_messages = [content for role, content in public_requests[2]["messages"] if role == "system"]
+    assert any(
+        content.startswith("你是一个偏系统性与结构化思考的智能助手。")
+        for content in architect_system_messages
+    )
+    assert any(
+        content.startswith("你是一个偏风险识别和问题质疑的智能助手。")
+        for content in critic_system_messages
+    )
+    assert any(
+        content.startswith("你是一个偏表达整理和内容组织的智能助手。")
+        for content in writer_system_messages
+    )
     assert any("Markdown 输出格式要求：" in content for content in architect_system_messages)
     assert any("Markdown 输出格式要求：" in content for content in critic_system_messages)
     assert any("Markdown 输出格式要求：" in content for content in writer_system_messages)
